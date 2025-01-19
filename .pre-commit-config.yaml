@@ -1,12 +1,12 @@
 default_language_version:
-  python: python3.11
+  python: python3
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.4.0
     hooks:
       - id: no-commit-to-branch
-        args: ["--branch", "main", "--branch", "staging", "--branch", "dev"]
+        args: ["--branch", "main", "--branch", "dev"]
       - id: mixed-line-ending
       - id: end-of-file-fixer
         exclude: '(\.sql|\.out|\.rs)$'
@@ -28,6 +28,7 @@ repos:
       - id: check-vcs-permalinks
       - id: detect-private-key
       - id: detect-aws-credentials
+        args: ["--allow-missing-credentials"]
       - id: debug-statements
       - id: destroyed-symlinks
       - id: fix-encoding-pragma
@@ -79,3 +80,8 @@ repos:
     hooks:
       - id: mintlify-validate
         args: [docs]
+
+  - repo: https://github.com/ComPWA/mirrors-taplo
+    rev: "v0.9.3"
+    hooks:
+      - id: taplo-format

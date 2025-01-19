@@ -7,9 +7,10 @@ name: Lint Docker
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - "docker/*"
       - ".github/workflows/lint-docker.yml"
+      - "docker/**"
   workflow_dispatch:
 
 concurrency:
@@ -19,7 +20,8 @@ concurrency:
 jobs:
   lint-docker:
     name: Lint Dockerfiles
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
+    if: github.event.pull_request.draft == false
 
     steps:
       - name: Checkout Git Repository

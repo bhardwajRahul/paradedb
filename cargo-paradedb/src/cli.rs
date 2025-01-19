@@ -1,3 +1,20 @@
+// Copyright (c) 2023-2025 Retake, Inc.
+//
+// This file is part of ParadeDB - Postgres for Search and Analytics
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 use clap::Parser;
 
 const DEFAULT_BENCH_ESLOGS_TABLE: &str = "benchmark_eslogs";
@@ -31,6 +48,7 @@ pub struct CorpusArgs {
 pub enum Corpus {
     // The generated logs from the ElasticSearch benchmark tool.
     Eslogs(EsLogsArgs),
+    Hits(HitsArgs),
 }
 
 /// A wrapper struct for the command to run on the eslogs corpus.
@@ -38,6 +56,13 @@ pub enum Corpus {
 pub struct EsLogsArgs {
     #[command(subcommand)]
     pub command: EsLogsCommand,
+}
+
+/// A wrapper struct for the command to run on the hits corpus.
+#[derive(Debug, clap::Args)]
+pub struct HitsArgs {
+    #[command(subcommand)]
+    pub command: HitsCommand,
 }
 
 /// The command to run on the eslogs corpus.
@@ -71,11 +96,36 @@ pub enum EsLogsCommand {
         url: String,
     },
     QuerySearchIndex {
-        /// Postgres index name to query.
-        #[arg(short, long, default_value = DEFAULT_BENCH_ESLOGS_INDEX_NAME)]
-        index: String,
+        /// Postgres table name to query.
+        #[arg(short, long, default_value = DEFAULT_BENCH_ESLOGS_TABLE)]
+        table: String,
         /// Query to run.
         #[arg(short, long, default_value = "message:flame")]
+        query: String,
+        /// Limit results to return.
+        #[arg(short, long, default_value_t = 1)]
+        limit: u64,
+        /// Postgres database url to connect to.
+        #[arg(short, long, env = "DATABASE_URL")]
+        url: String,
+    },
+    BuildGinIndex {
+        /// Postgres table name to index.
+        #[arg(short, long, default_value = DEFAULT_BENCH_ESLOGS_TABLE)]
+        table: String,
+        /// Postgres table name to index.
+        #[arg(short, long, default_value = DEFAULT_BENCH_ESLOGS_INDEX_NAME)]
+        index: String,
+        /// Postgres database url to connect to.
+        #[arg(short, long, env = "DATABASE_URL")]
+        url: String,
+    },
+    QueryGinIndex {
+        /// Postgres index name to query.
+        #[arg(short, long, default_value = DEFAULT_BENCH_ESLOGS_TABLE)]
+        table: String,
+        /// Query to run.
+        #[arg(short, long, default_value = "flame")]
         query: String,
         /// Limit results to return.
         #[arg(short, long, default_value_t = 1)]
@@ -123,6 +173,24 @@ pub enum EsLogsCommand {
         /// Should contain the index name as a path subcomponent.
         #[arg(short, long)]
         elastic_url: String,
+    },
+}
+/// The command to run on the hits corpus.
+#[derive(Debug, clap::Subcommand)]
+pub enum HitsCommand {
+    /// Generate the hits corpus, inserting into a Postgres table.
+    Run {
+        /// Workload to benchmark, defaults to a file size of 100MB.
+        /// - 'single' Runs the full ClickBench benchmark against a single Parquet file
+        /// - 'partitioned' Runs the full ClickBench benchmark against one hundred partitioned Parquet files
+        #[arg(long, short, default_value = "single")]
+        workload: String,
+        /// Postgres database url to connect to.
+        #[arg(short, long, env = "DATABASE_URL")]
+        url: String,
+        /// Use the full dataset or a smaller version?
+        #[arg(short, long, default_value_t = false)]
+        full: bool,
     },
 }
 

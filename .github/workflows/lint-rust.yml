@@ -7,8 +7,10 @@ name: Lint Rust
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "**/*.rs"
+      - "**/*.toml"
       - ".github/workflows/lint-rust.yml"
   workflow_dispatch:
 
@@ -19,10 +21,11 @@ concurrency:
 jobs:
   lint-rust:
     name: Lint Rust Files
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
+    if: github.event.pull_request.draft == false
     strategy:
       matrix:
-        pg_version: [16]
+        pg_version: [17]
 
     steps:
       - name: Checkout Git Repository
@@ -30,8 +33,24 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract pgrx Version
+        id: pgrx
+        working-directory: pg_search/
+        run: |
+          version=$(cargo tree --depth 1 -i pgrx -p pg_search | head -n 1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      # Caches from base branches are available to PRs, but not across unrelated branches, so we only
+      # save the cache on the 'dev' branch, but load it on all branches.
+      - name: Install Rust Cache
+        uses: ubicloud/rust-cache@v2
         with:
-          components: clippy,rustfmt
+          prefix-key: "v1-rust"
+          key: ${{ matrix.pg_version }}-${{ steps.pgrx.outputs.version }}
+          cache-targets: true
+          cache-all-crates: true
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
 
       - name: Install & Configure Supported PostgreSQL Version
         run: |
@@ -40,7 +59,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }}
 
       - name: Install pgrx
-        run: cargo install --locked cargo-pgrx --version 0.11.3
+        run: cargo install --locked cargo-pgrx --version ${{ steps.pgrx.outputs.version }} --debug
 
       - name: Initialize pgrx for Current PostgreSQL Version
         run: cargo pgrx init --pg${{ matrix.pg_version }}=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
@@ -50,3 +69,16 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings --no-deps
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete --debug
+
+      - name: Install taplo
+        run: cargo install taplo-cli --version ^0.9 --locked --debug
+
+      - name: Run cargo-machete
+        run: cargo machete
+
+      # If you encounter an error, try running 'taplo format' to fix the formatting automatically.
+      - name: Check Cargo.toml Formatting
+        run: taplo format --check

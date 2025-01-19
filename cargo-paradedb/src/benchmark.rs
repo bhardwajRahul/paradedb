@@ -1,7 +1,23 @@
+// Copyright (c) 2023-2025 Retake, Inc.
+//
+// This file is part of ParadeDB - Postgres for Search and Analytics
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 use anyhow::Result;
 use async_std::sync::Mutex;
 use async_std::task::block_on;
-use criterion::async_executor::AsyncStdExecutor;
 use criterion::Criterion;
 use sqlx::Executor;
 use sqlx::{postgres::PgConnectOptions, Connection, PgConnection};
@@ -51,13 +67,10 @@ impl Benchmark {
                 self.setup_query(&mut conn).await.unwrap();
             });
 
-            runner.to_async(AsyncStdExecutor).iter(|| {
+            let mut conn = block_on(conn.lock());
+            runner.iter(|| {
                 // Measured code goes here.
-                async {
-                    let local_conn = conn.clone();
-                    let mut conn = local_conn.lock().await; // Acquire the lock asynchronously.
-                    sqlx::query(&self.query).execute(&mut *conn).await.unwrap();
-                }
+                block_on(sqlx::query(&self.query).execute(&mut *conn)).unwrap();
             });
         });
 

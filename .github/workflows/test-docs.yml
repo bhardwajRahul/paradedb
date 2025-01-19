@@ -7,13 +7,13 @@ name: Test Docs
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
-      - staging
       - dev
     paths:
-      - "docs/**"
       - ".github/workflows/test-docs.yml"
+      - "docs/**"
   workflow_dispatch:
 
 concurrency:
@@ -23,7 +23,8 @@ concurrency:
 jobs:
   test-docs:
     name: Test Docs for Broken Links
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-2
+    if: github.event.pull_request.draft == false
 
     steps:
       - name: Checkout Git Repository
@@ -36,11 +37,9 @@ jobs:
         working-directory: docs/
         run: |
           output=$(mintlify broken-links)
-
-          # Check if the output contains any broken links
           if [[ "$output" == *"No broken links found."* ]]; then
             echo "No broken links found."
           else
-            >&2 echo "$output"
+            echo "$output"
             exit 1
           fi

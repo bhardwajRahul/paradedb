@@ -1,3 +1,20 @@
+// Copyright (c) 2023-2025 Retake, Inc.
+//
+// This file is part of ParadeDB - Postgres for Search and Analytics
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 use crate::benchmark::Benchmark;
 use crate::tables::{benchlogs::EsLog, PathReader};
 use anyhow::{bail, Result};
@@ -29,8 +46,24 @@ pub fn install() -> Result<()> {
 
     // Using `exec` will replace the terminate the current process and replace it
     // with the command we've defined, as opposed to running it as a subprocess.
-    command.exec();
+    let _ = command.exec();
     Ok(())
+}
+
+/// Find the path to elastic-integration-corpus-generator-tool.
+fn find_elastic_generator() -> Result<String> {
+    let gobin_path = run_fun!(go env GOBIN)?;
+    if !gobin_path.is_empty() {
+        return Ok(format!(
+            "{gobin_path}/elastic-integration-corpus-generator-tool"
+        ));
+    }
+
+    let go_path = run_fun!(go env GOPATH)?;
+
+    Ok(format!(
+        "{go_path}/bin/elastic-integration-corpus-generator-tool"
+    ))
 }
 
 // As a note from researching the corpus generated for elasticsearch's benchmarks...
@@ -65,9 +98,7 @@ pub async fn bench_eslogs_generate(
     run_cmd!(curl -s -f -o $fields_file $opensearch_repo_url/dataset/fields.yml)?;
     run_cmd!(curl -s -f -o $config_file $opensearch_repo_url/dataset/config-1.yml)?;
 
-    // Set up necessary executable paths to call the generator tool.
-    let go_path = run_fun!(go env GOPATH)?;
-    let generator_exe = format!("{go_path}/bin/elastic-integration-corpus-generator-tool");
+    let generator_exe = find_elastic_generator()?;
 
     // Set up Postgres connection and ensure the table exists.
     debug!(DATABASE_URL = url);
@@ -161,16 +192,17 @@ pub async fn bench_eslogs_build_search_index(
     index: String,
     url: String,
 ) -> Result<()> {
-    let drop_query = format!("CALL paradedb.drop_bm25('{index}')");
+    let drop_query = format!(
+        "
+            CREATE EXTENSION IF NOT EXISTS pg_search;
+            DROP INDEX IF EXISTS {index};
+        "
+    );
 
-    let text_fields = r#"{"message": {}}"#;
     let create_query = format!(
-        "CALL paradedb.create_bm25(
-            table_name => '{table}',
-            index_name => '{index}',
-            key_field => 'id',
-            text_fields => '{text_fields}'
-        );"
+        r#"
+        CREATE INDEX {index} on {table} USING bm25 (id, message) WITH (key_field='id')
+        "#
     );
 
     Benchmark {
@@ -186,7 +218,7 @@ pub async fn bench_eslogs_build_search_index(
 }
 
 pub async fn bench_eslogs_query_search_index(
-    index: String,
+    table: String,
     query: String,
     limit: u64,
     url: String,
@@ -195,7 +227,41 @@ pub async fn bench_eslogs_query_search_index(
         group_name: "Search Query".into(),
         function_name: "bench_eslogs_query_search_index".into(),
         setup_query: None,
-        query: format!("SELECT * FROM {index}.search('{query}', limit_rows => {limit});"),
+        query: format!("SELECT * FROM {table} WHERE {table} @@@ '{query}' LIMIT {limit}"),
+        database_url: url,
+    }
+    .run_pg()
+    .await
+}
+
+pub async fn bench_eslogs_build_gin_index(table: String, index: String, url: String) -> Result<()> {
+    let drop_query = format!("DROP INDEX IF EXISTS {index}");
+
+    let create_query =
+        format!("CREATE INDEX {index} ON {table} USING gin ((to_tsvector('english', message)));");
+
+    Benchmark {
+        group_name: "GIN TSQuery/TSVector Index".into(),
+        function_name: "bench_eslogs_build_gin_index".into(),
+        setup_query: Some(drop_query),
+        query: create_query,
+        database_url: url,
+    }
+    .run_pg_once()
+    .await
+}
+
+pub async fn bench_eslogs_query_gin_index(
+    table: String,
+    query: String,
+    limit: u64,
+    url: String,
+) -> Result<()> {
+    Benchmark {
+        group_name: "GIN TSQuery/TSVector Query".into(),
+        function_name: "bench_eslogs_query_gin_index".into(),
+        setup_query: None,
+        query: format!("SELECT * FROM {table} WHERE to_tsvector('english', message) @@ to_tsquery('{query}') LIMIT {limit};"),
         database_url: url,
     }
     .run_pg()
