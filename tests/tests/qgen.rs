@@ -18,7 +18,9 @@
 mod fixtures;
 
 use crate::fixtures::querygen::arb_joins_and_wheres;
+use crate::fixtures::querygen::compare;
 use crate::fixtures::querygen::joingen::JoinType;
+use crate::fixtures::querygen::pagegen::arb_paging_exprs;
 use crate::fixtures::querygen::wheregen::arb_wheres;
 
 use fixtures::*;
@@ -41,37 +43,43 @@ fn generated_queries_setup(conn: &mut PgConnection, tables: &[(&str, usize)]) ->
             r#"
 CREATE TABLE {tname}
 (
-    id    serial8 not null primary key,
-    name  text,
-    color varchar,
-    age   varchar
+    id    SERIAL8 NOT NULL PRIMARY KEY,
+    uuid  UUID NOT NULL,
+    name  TEXT,
+    color VARCHAR,
+    age   VARCHAR
 );
 
-INSERT into {tname} (name, color, age)
-VALUES ('bob', 'blue', 20);
-
-INSERT into {tname} (name, color, age)
-SELECT(ARRAY ['alice','bob','cloe', 'sally','brandy','brisket','anchovy']::text[])[(floor(random() * 7) + 1)::int],
-      (ARRAY ['red','green','blue', 'orange','purple','pink','yellow']::text[])[(floor(random() * 7) + 1)::int],
-      (floor(random() * 100) + 1)::int::text
-FROM generate_series(1, {row_count});
-
-CREATE INDEX idx{tname} ON {tname} USING bm25 (id, name, color, age)
+-- Note: Create the index before inserting rows to encourage multiple segments being created.
+CREATE INDEX idx{tname} ON {tname} USING bm25 (id, uuid, name, color, age)
 WITH (
 key_field = 'id',
 text_fields = '
             {{
+                "uuid": {{ "tokenizer": {{ "type": "keyword" }}, "fast": true }},
                 "name": {{ "tokenizer": {{ "type": "keyword" }}, "fast": true }},
                 "color": {{ "tokenizer": {{ "type": "keyword" }}, "fast": true }},
                 "age": {{ "tokenizer": {{ "type": "keyword" }}, "fast": true }}
             }}'
 );
+
+INSERT into {tname} (uuid, name, color, age)
+VALUES (gen_random_uuid(), 'bob', 'blue', 20);
+
+INSERT into {tname} (uuid, name, color, age)
+SELECT
+      gen_random_uuid(),
+      (ARRAY ['alice','bob','cloe', 'sally','brandy','brisket','anchovy']::text[])[(floor(random() * 7) + 1)::int],
+      (ARRAY ['red','green','blue', 'orange','purple','pink','yellow']::text[])[(floor(random() * 7) + 1)::int],
+      (floor(random() * 100) + 1)::int::text
+FROM generate_series(1, {row_count});
+
+CREATE INDEX idx{tname}_uuid ON {tname} (uuid);
 CREATE INDEX idx{tname}_name ON {tname} (name);
 CREATE INDEX idx{tname}_color ON {tname} (color);
 CREATE INDEX idx{tname}_age ON {tname} (age);
 ANALYZE;
-"#,
-            tname = tname
+"#
         );
 
         (&sql).execute(conn);
@@ -112,25 +120,22 @@ async fn generated_joins_small(database: Db) {
 
         let from = format!("SELECT COUNT(*) {join_clause} ");
 
-        let pg = format!("{from} WHERE {}", where_expr.to_sql(" = "));
-        let bm25 = format!("{from} WHERE {}", where_expr.to_sql("@@@"));
-
-        let (pg_cnt,) = (&pg).fetch_one::<(i64,)>(&mut pool.pull());
-        let (bm25_cnt,) = (&bm25).fetch_one::<(i64,)>(&mut pool.pull());
-        prop_assert_eq!(
-            pg_cnt,
-            bm25_cnt,
-            "\npg:\n  {}\nbm25:\n  {}\nexplain:\n{}\n",
-            pg,
-            bm25,
-            format!("EXPLAIN {bm25}").fetch::<(String,)>(&mut pool.pull()).into_iter().map(|(s,)| s).collect::<Vec<_>>().join("\n"),
-        );
+        compare(
+            format!("{from} WHERE {}", where_expr.to_sql(" = ")),
+            format!("{from} WHERE {}", where_expr.to_sql("@@@")),
+            &mut pool.pull(),
+            |query, conn| query.fetch_one::<(i64,)>(conn).0,
+        )?;
     });
 }
 
 ///
 /// Tests only the smallest JoinType against larger tables, with a target list, and a limit.
 ///
+/// TODO: This test is currently ignored because it occasionally generates nested loop joins which
+/// run in exponential time: https://github.com/paradedb/paradedb/issues/2733
+///
+#[ignore]
 #[rstest]
 #[tokio::test]
 async fn generated_joins_large_limit(database: Db) {
@@ -166,20 +171,12 @@ async fn generated_joins_large_limit(database: Db) {
                 .join(", ");
         let from = format!("SELECT {target_list} {join_clause} ");
 
-        let pg = format!("{from} WHERE {} LIMIT 10;", where_expr.to_sql(" = "));
-        let bm25 = format!("{from} WHERE {} LIMIT 10;", where_expr.to_sql("@@@"));
-
-        // Because we use a generated target list, we fetch as dynamic to allow for comparison.
-        let pg_rows = (&pg).fetch_dynamic(&mut pool.pull());
-        let bm25_rows = (&bm25).fetch_dynamic(&mut pool.pull());
-        prop_assert_eq!(
-            pg_rows.len(),
-            bm25_rows.len(),
-            "\npg:\n  {}\nbm25:\n  {}\nexplain:\n{}\n",
-            pg,
-            bm25,
-            format!("EXPLAIN {bm25}").fetch::<(String,)>(&mut pool.pull()).into_iter().map(|(s,)| s).collect::<Vec<_>>().join("\n"),
-        );
+        compare(
+            format!("{from} WHERE {} LIMIT 10;", where_expr.to_sql(" = ")),
+            format!("{from} WHERE {} LIMIT 10;", where_expr.to_sql("@@@")),
+            &mut pool.pull(),
+            |query, conn| query.fetch_dynamic(conn).len(),
+        )?;
     });
 }
 
@@ -192,7 +189,8 @@ async fn generated_single_relation(database: Db) {
     );
 
     let table_name = "users";
-    generated_queries_setup(&mut pool.pull(), &[(table_name, 10)]);
+    let setup_sql = generated_queries_setup(&mut pool.pull(), &[(table_name, 10)]);
+    eprintln!("{setup_sql}");
 
     proptest!(|(
         where_expr in arb_wheres(
@@ -200,21 +198,131 @@ async fn generated_single_relation(database: Db) {
             vec![("name", "bob"), ("color", "blue"), ("age", "20")]
         ),
     )| {
-        let where_clause = where_expr.to_sql(" = ");
-        let pg = format!("SELECT COUNT(*) FROM {table_name} WHERE {where_clause}");
-        let bm25 = format!(
-            "SELECT COUNT(*) FROM {table_name} WHERE ({where_clause}) AND id @@@ paradedb.all()"
-        ); // force a pushdown
+        compare(
+            format!("SELECT id FROM {table_name} WHERE {}", where_expr.to_sql(" = ")),
+            format!("SELECT id FROM {table_name} WHERE {}", where_expr.to_sql("@@@")),
+            &mut pool.pull(),
+            |query, conn| {
+                let mut rows = query.fetch::<(i64,)>(conn);
+                rows.sort();
+                rows
+            }
+        )?;
+    });
+}
 
-        let (pg_cnt,) = (&pg).fetch_one::<(i64,)>(&mut pool.pull());
-        let (bm25_cnt,) = (&bm25).fetch_one::<(i64,)>(&mut pool.pull());
-        prop_assert_eq!(
-            pg_cnt,
-            bm25_cnt,
-            "\npg:\n  {}\nbm25:\n  {}\nexplain:\n{}\n",
+#[rstest]
+#[tokio::test]
+async fn generated_paging_small(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "users";
+    let setup_sql = generated_queries_setup(&mut pool.pull(), &[(table_name, 1000)]);
+    eprintln!("{setup_sql}");
+
+    proptest!(|(
+        where_expr in arb_wheres(vec![table_name], vec![("name", "bob")]),
+        // TODO: Until https://github.com/paradedb/paradedb/issues/2642 is resolved, we do not
+        // tiebreak appropriately for compound columns, and so we do not pass any non-tiebreak
+        // columns here.
+        paging_exprs in arb_paging_exprs(table_name, vec![], vec!["id", "uuid"]),
+    )| {
+        compare(
+            format!("SELECT id FROM {table_name} WHERE {} {paging_exprs}", where_expr.to_sql(" = ")),
+            format!("SELECT id FROM {table_name} WHERE {} {paging_exprs}", where_expr.to_sql("@@@")),
+            &mut pool.pull(),
+            |query, conn| query.fetch::<(i64,)>(conn),
+        )?;
+    });
+}
+
+/// Generates paging expressions on a large table, which was necessary to reproduce
+/// https://github.com/paradedb/tantivy/pull/51
+///
+/// TODO: Explore whether this could use https://github.com/paradedb/paradedb/pull/2681
+/// to use a large segment count rather than a large table size.
+#[rstest]
+#[tokio::test]
+async fn generated_paging_large(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let table_name = "users";
+    let setup_sql = generated_queries_setup(&mut pool.pull(), &[(table_name, 100000)]);
+    eprintln!("{setup_sql}");
+
+    proptest!(|(
+        paging_exprs in arb_paging_exprs(table_name, vec![], vec!["uuid"]),
+    )| {
+        compare(
+            format!("SELECT uuid::text FROM {table_name} WHERE name  =  'bob' {paging_exprs}"),
+            format!("SELECT uuid::text FROM {table_name} WHERE name @@@ 'bob' {paging_exprs}"),
+            &mut pool.pull(),
+            |query, conn| query.fetch::<(String,)>(conn),
+        )?;
+    });
+}
+
+#[rstest]
+#[tokio::test]
+async fn generated_subquery(database: Db) {
+    let pool = MutexObjectPool::<PgConnection>::new(
+        move || block_on(async { database.connection().await }),
+        |_| {},
+    );
+
+    let outer_table_name = "products";
+    let inner_table_name = "orders";
+    let setup_sql = generated_queries_setup(
+        &mut pool.pull(),
+        &[(outer_table_name, 10), (inner_table_name, 10)],
+    );
+    eprintln!("{setup_sql}");
+
+    proptest!(|(
+        outer_where_expr in arb_wheres(
+            vec![outer_table_name],
+            vec![("name", "bob"), ("color", "blue"), ("age", "20")]
+        ),
+        inner_where_expr in arb_wheres(
+            vec![inner_table_name],
+            vec![("name", "bob"), ("color", "blue"), ("age", "20")]
+        ),
+        subquery_column in proptest::sample::select(&["name", "color", "age"]),
+        // TODO: Until https://github.com/paradedb/paradedb/issues/2642 is resolved, we do not
+        // tiebreak appropriately for compound columns, and so we do not pass any non-tiebreak
+        // columns here.
+        // TODO: Not ordering by `uuid` until https://github.com/paradedb/paradedb/issues/2703
+        // is fixed.
+        paging_exprs in arb_paging_exprs(inner_table_name, vec![], vec!["id"]),
+    )| {
+        let pg = format!(
+            "SELECT COUNT(*) FROM {outer_table_name} \
+            WHERE {outer_table_name}.{subquery_column} IN (\
+                SELECT {subquery_column} FROM {inner_table_name} WHERE {} {paging_exprs}\
+            ) AND {}",
+            inner_where_expr.to_sql(" = "),
+            outer_where_expr.to_sql(" = "),
+        );
+        let bm25 = format!(
+            "SELECT COUNT(*) FROM {outer_table_name} \
+            WHERE {outer_table_name}.{subquery_column} IN (\
+                SELECT {subquery_column} FROM {inner_table_name} WHERE {} {paging_exprs}\
+            ) AND {}",
+            inner_where_expr.to_sql("@@@"),
+            outer_where_expr.to_sql("@@@"),
+        );
+
+        compare(
             pg,
             bm25,
-            format!("EXPLAIN {bm25}").fetch::<(String,)>(&mut pool.pull()).into_iter().map(|(s,)| s).collect::<Vec<_>>().join("\n"),
-        );
+            &mut pool.pull(),
+            |query, conn| query.fetch_one::<(i64,)>(conn),
+        )?;
     });
 }

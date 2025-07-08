@@ -15,27 +15,25 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::api::index::FieldName;
+use crate::api::FieldName;
 use crate::api::HashMap;
 use crate::index::fast_fields_helper::FFType;
 use crate::index::mvcc::MvccSatisfies;
 use crate::index::reader::index::scorer_iter::DeferredScorer;
 use crate::index::setup_tokenizers;
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::storage::block::CLEANUP_LOCK;
 use crate::postgres::storage::buffer::{BufferManager, PinnedBuffer};
 use crate::query::SearchQueryInput;
-use crate::schema::SearchField;
 use crate::schema::SearchIndexSchema;
 use anyhow::Result;
-use pgrx::{pg_sys, PgRelation};
 use std::cmp::Ordering;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tantivy::collector::{Collector, TopDocs};
 use tantivy::index::{Index, SegmentId};
-use tantivy::query::{EnableScoring, QueryClone, QueryParser};
-use tantivy::schema::FieldType;
+use tantivy::query::{EnableScoring, QueryClone, QueryParser, Weight};
 use tantivy::snippet::SnippetGenerator;
 use tantivy::{
     query::Query, DocAddress, DocId, DocSet, Executor, IndexReader, Order, ReloadPolicy, Score,
@@ -228,13 +226,14 @@ impl Iterator for SearchResults {
     }
 }
 
-#[derive(Clone)]
 pub struct SearchIndexReader {
-    index_oid: pg_sys::Oid,
+    index_rel: PgSearchRelation,
     searcher: Searcher,
     schema: SearchIndexSchema,
     underlying_reader: IndexReader,
     underlying_index: Index,
+    query: Box<dyn Query>,
+    need_scores: bool,
 
     // [`PinnedBuffer`] has a Drop impl, so we hold onto it but don't otherwise use it
     //
@@ -243,8 +242,35 @@ pub struct SearchIndexReader {
     _cleanup_lock: Arc<PinnedBuffer>,
 }
 
+impl Clone for SearchIndexReader {
+    fn clone(&self) -> Self {
+        Self {
+            index_rel: self.index_rel.clone(),
+            searcher: self.searcher.clone(),
+            schema: self.schema.clone(),
+            underlying_reader: self.underlying_reader.clone(),
+            underlying_index: self.underlying_index.clone(),
+            query: self.query.box_clone(),
+            need_scores: self.need_scores,
+            _cleanup_lock: self._cleanup_lock.clone(),
+        }
+    }
+}
+
 impl SearchIndexReader {
-    pub fn open(index_relation: &PgRelation, mvcc_style: MvccSatisfies) -> Result<Self> {
+    /// Open a tantivy index where, if searched, will return zero results, but has access to all
+    /// the underlying [`SegmentReader`]s and such as specified by the `mvcc_style`.
+    pub fn empty(index_relation: &PgSearchRelation, mvcc_style: MvccSatisfies) -> Result<Self> {
+        Self::open(index_relation, SearchQueryInput::Empty, false, mvcc_style)
+    }
+
+    /// Open a tantivy index that, when searched, will return the results of the specified [`SearchQueryInput`].
+    pub fn open(
+        index_relation: &PgSearchRelation,
+        search_query_input: SearchQueryInput,
+        need_scores: bool,
+        mvcc_style: MvccSatisfies,
+    ) -> Result<Self> {
         // It is possible for index only scans and custom scans, which only check the visibility map
         // and do not fetch tuples from the heap, to suffer from the concurrent TID recycling problem.
         // This problem occurs due to a race condition: after vacuum is called, a concurrent index only or custom scan
@@ -255,25 +281,44 @@ impl SearchIndexReader {
         //
         // It's sufficient, and **required** for parallel scans to operate correctly, for us to hold onto
         // a pinned but unlocked buffer.
-        let cleanup_lock = BufferManager::new(index_relation.oid()).pinned_buffer(CLEANUP_LOCK);
+        let cleanup_lock = BufferManager::new(index_relation).pinned_buffer(CLEANUP_LOCK);
 
         let directory = mvcc_style.directory(index_relation);
         let mut index = Index::open(directory)?;
-        let schema = SearchIndexSchema::open(index.schema(), index_relation);
+        let schema = index_relation.schema()?;
+        setup_tokenizers(index_relation, &mut index)?;
 
-        setup_tokenizers(&mut index, index_relation);
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
         let searcher = reader.searcher();
 
+        let need_scores = need_scores || search_query_input.need_scores();
+        let query = {
+            let mut parser = QueryParser::for_index(
+                &index,
+                schema.fields().map(|(field, _)| field).collect::<Vec<_>>(),
+            );
+            search_query_input
+                .into_tantivy_query(
+                    &schema,
+                    &mut parser,
+                    &searcher,
+                    index_relation.oid(),
+                    index_relation.rel_oid(),
+                )
+                .expect("must be able to parse query")
+        };
+
         Ok(Self {
-            index_oid: index_relation.oid(),
+            index_rel: index_relation.clone(),
             searcher,
             schema,
             underlying_reader: reader,
             underlying_index: index,
+            query,
+            need_scores,
             _cleanup_lock: Arc::new(cleanup_lock),
         })
     }
@@ -286,29 +331,46 @@ impl SearchIndexReader {
             .collect()
     }
 
-    pub fn key_field(&self) -> SearchField {
-        self.schema.key_field()
+    pub fn need_scores(&self) -> bool {
+        self.need_scores
     }
 
-    pub fn query(&self, search_query_input: &SearchQueryInput) -> Box<dyn Query> {
+    pub fn query(&self) -> &dyn Query {
+        &self.query
+    }
+
+    pub fn weight(&self) -> Box<dyn Weight> {
+        self.query
+            .weight(if self.need_scores {
+                tantivy::query::EnableScoring::Enabled {
+                    searcher: &self.searcher,
+                    statistics_provider: &self.searcher,
+                }
+            } else {
+                tantivy::query::EnableScoring::Disabled {
+                    schema: self.schema.tantivy_schema(),
+                    searcher_opt: Some(&self.searcher),
+                }
+            })
+            .expect("weight should be constructable")
+    }
+
+    pub fn make_query(&self, search_query_input: SearchQueryInput) -> Box<dyn Query> {
         let mut parser = QueryParser::for_index(
             &self.underlying_index,
             self.schema
-                .fields
-                .iter()
-                .map(|search_field| search_field.id.0)
+                .fields()
+                .map(|(field, _)| field)
                 .collect::<Vec<_>>(),
         );
         search_query_input
             .clone()
             .into_tantivy_query(
-                &(
-                    unsafe { &PgRelation::with_lock(self.index_oid, pg_sys::AccessShareLock as _) },
-                    &self.schema,
-                ),
+                &self.schema,
                 &mut parser,
                 &self.searcher,
-                self.index_oid,
+                self.index_rel.oid(),
+                self.index_rel.rel_oid(),
             )
             .expect("must be able to parse query")
     }
@@ -344,22 +406,25 @@ impl SearchIndexReader {
 
     pub fn snippet_generator(
         &self,
-        field_name: &FieldName,
-        query: &SearchQueryInput,
+        field_name: impl AsRef<str> + Display,
+        query: SearchQueryInput,
     ) -> (tantivy::schema::Field, SnippetGenerator) {
-        let field = self
+        let search_field = self
             .schema
-            .get_search_field(field_name)
-            .expect("cannot generate snippet, field does not exist");
-
-        match self.schema.schema.get_field_entry(field.into()).field_type() {
-            FieldType::Str(_) => {
-                let field:tantivy::schema::Field = field.into();
-                let generator = SnippetGenerator::create(&self.searcher, &self.query(query), field)
-                    .unwrap_or_else(|err| panic!("failed to create snippet generator for field: {field_name}... {err}"));
-                (field, generator)
-            }
-            _ => panic!("failed to create snippet generator for field: {field_name}... can only highlight text fields")
+            .search_field(&field_name)
+            .unwrap_or_else(|| panic!("snippet_generator: field {field_name} should exist"));
+        if search_field.is_text() || search_field.is_json() {
+            let field = search_field.field();
+            let generator =
+                SnippetGenerator::create(&self.searcher, &self.make_query(query), field)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to create snippet generator for field: {field_name}... {err}"
+                        )
+                    });
+            (field, generator)
+        } else {
+            panic!("failed to create snippet generator for field: {field_name}... can only highlight text fields")
         }
     }
 
@@ -369,14 +434,7 @@ impl SearchIndexReader {
     ///
     /// It has no understanding of Postgres MVCC visibility.  It is the caller's responsibility to
     /// handle that, if it's necessary.
-    pub fn search(
-        &self,
-        need_scores: bool,
-        _sort_segments_by_ctid: bool,
-        query: &SearchQueryInput,
-        _estimated_rows: Option<usize>,
-    ) -> SearchResults {
-        let query = self.query(query);
+    pub fn search(&self, _estimated_rows: Option<usize>) -> SearchResults {
         let iters = self
             .searcher()
             .segment_readers()
@@ -385,8 +443,8 @@ impl SearchIndexReader {
             .map(move |(segment_ord, segment_reader)| {
                 scorer_iter::ScorerIter::new(
                     DeferredScorer::new(
-                        query.box_clone(),
-                        need_scores,
+                        self.query().box_clone(),
+                        self.need_scores,
                         segment_reader.clone(),
                         self.searcher.clone(),
                     ),
@@ -407,18 +465,14 @@ impl SearchIndexReader {
     /// handle that, if it's necessary.
     pub fn search_segments(
         &self,
-        need_scores: bool,
         segment_ids: impl Iterator<Item = SegmentId>,
-        query: &SearchQueryInput,
         offset: usize,
     ) -> SearchResults {
-        let query = self.query(query);
-
         let iters = self.collect_segments(segment_ids, |segment_ord, segment_reader| {
             scorer_iter::ScorerIter::new(
                 DeferredScorer::new(
-                    query.box_clone(),
-                    need_scores,
+                    self.query().box_clone(),
+                    self.need_scores,
                     segment_reader.clone(),
                     self.searcher.clone(),
                 ),
@@ -441,48 +495,28 @@ impl SearchIndexReader {
     pub fn search_top_n_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
-        query: &SearchQueryInput,
         sort_field: Option<FieldName>,
         sortdir: SortDirection,
         n: usize,
         offset: usize,
-        need_scores: bool,
     ) -> SearchResults {
         if let Some(sort_field) = sort_field {
-            assert!(
-                !need_scores,
-                "cannot sort by field and get scores in the same query"
-            );
             let field = self
                 .schema
-                .get_search_field(&sort_field)
+                .search_field(&sort_field)
                 .expect("sort field should exist in index schema");
-            match self
-                .schema
-                .schema
-                .get_field_entry(field.into())
-                .field_type()
-                .value_type()
-            {
+            match field.field_entry().field_type().value_type() {
                 tantivy::schema::Type::Str => self.top_by_string_field_in_segments(
                     segment_ids,
-                    query,
                     sort_field,
                     sortdir,
                     n,
                     offset,
                 ),
-                _ => self.top_by_field_in_segments(
-                    segment_ids,
-                    query,
-                    sort_field,
-                    sortdir,
-                    n,
-                    offset,
-                ),
+                _ => self.top_by_field_in_segments(segment_ids, sort_field, sortdir, n, offset),
             }
         } else {
-            self.top_by_score_in_segments(segment_ids, query, sortdir, n, offset, need_scores)
+            self.top_by_score_in_segments(segment_ids, sortdir, n, offset)
         }
     }
 
@@ -496,8 +530,7 @@ impl SearchIndexReader {
     fn top_by_field_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
-        query: &SearchQueryInput,
-        sort_field: FieldName,
+        sort_field: impl AsRef<str> + Display,
         sortdir: SortDirection,
         n: usize,
         offset: usize,
@@ -505,8 +538,8 @@ impl SearchIndexReader {
         let collector = TopDocs::with_limit(n)
             .and_offset(offset)
             .order_by_u64_field(&sort_field, sortdir.into());
-        let query = self.query(query);
-        let weight = query
+        let weight = self
+            .query
             .weight(tantivy::query::EnableScoring::Enabled {
                 searcher: &self.searcher,
                 statistics_provider: &self.searcher,
@@ -546,7 +579,6 @@ impl SearchIndexReader {
     fn top_by_string_field_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
-        query: &SearchQueryInput,
         sort_field: FieldName,
         sortdir: SortDirection,
         n: usize,
@@ -555,8 +587,8 @@ impl SearchIndexReader {
         let collector = TopDocs::with_limit(n)
             .and_offset(offset)
             .order_by_string_fast_field(&sort_field, sortdir.into());
-        let query = self.query(query);
-        let weight = query
+        let weight = self
+            .query
             .weight(tantivy::query::EnableScoring::Enabled {
                 searcher: &self.searcher,
                 statistics_provider: &self.searcher,
@@ -595,17 +627,15 @@ impl SearchIndexReader {
     fn top_by_score_in_segments(
         &self,
         segment_ids: impl Iterator<Item = SegmentId>,
-        query: &SearchQueryInput,
         sortdir: SortDirection,
         n: usize,
         offset: usize,
-        need_scores: bool,
     ) -> SearchResults {
         match sortdir {
             // requires tweaking the score, which is a bit slower
             SortDirection::Asc => {
-                let query = self.query(query);
-                let weight = query
+                let weight = self
+                    .query
                     .weight(tantivy::query::EnableScoring::Enabled {
                         searcher: &self.searcher,
                         statistics_provider: &self.searcher,
@@ -640,8 +670,8 @@ impl SearchIndexReader {
 
             // can use tantivy's score directly
             SortDirection::Desc => {
-                let query = self.query(query);
-                let weight = query
+                let weight = self
+                    .query
                     .weight(tantivy::query::EnableScoring::Enabled {
                         searcher: &self.searcher,
                         statistics_provider: &self.searcher,
@@ -667,23 +697,14 @@ impl SearchIndexReader {
                 )
             }
 
-            SortDirection::None => self.search_segments(need_scores, segment_ids, query, offset),
+            SortDirection::None => self.search_segments(segment_ids, offset),
         }
     }
 
-    pub fn estimate_docs(&self, search_query_input: &SearchQueryInput) -> Option<usize> {
-        let largest_reader = self
-            .searcher
-            .segment_readers()
-            .iter()
-            .max_by_key(|reader| reader.num_docs())?;
-        let query = self.query(search_query_input);
-        let weight = query
-            .weight(enable_scoring(
-                search_query_input.need_scores(),
-                &self.searcher,
-            ))
-            .expect("weight should be constructable");
+    pub fn estimate_docs(&self, total_docs: f64) -> Option<usize> {
+        debug_assert!(self.searcher.segment_readers().len() == 1, "estimate_docs(): expected an index with only one segment, which is assumed to be the largest segment by num_docs");
+        let largest_reader = self.searcher.segment_reader(0);
+        let weight = self.weight();
         let mut scorer = weight
             .scorer(largest_reader, 1.0)
             .expect("counting docs in the largest segment should not fail");
@@ -694,25 +715,18 @@ impl SearchIndexReader {
             // but when it doesn't, we need to do a full count
             count = scorer.count_including_deleted() as usize;
         }
-        let segment_doc_proportion =
-            largest_reader.num_docs() as f64 / self.searcher.num_docs() as f64;
+        let segment_doc_proportion = largest_reader.num_docs() as f64 / total_docs;
 
         Some((count as f64 / segment_doc_proportion).ceil() as usize)
     }
 
-    pub fn collect<C: Collector>(
-        &self,
-        query: &SearchQueryInput,
-        collector: C,
-        need_scores: bool,
-    ) -> C::Fruit {
-        let owned_query = self.query(query);
+    pub fn collect<C: Collector>(&self, collector: C) -> C::Fruit {
         self.searcher
             .search_with_executor(
-                &owned_query,
+                &self.query,
                 &collector,
                 &Executor::SingleThread,
-                enable_scoring(need_scores, &self.searcher),
+                enable_scoring(self.need_scores, &self.searcher),
             )
             .expect("search should not fail")
     }

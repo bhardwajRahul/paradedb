@@ -50,8 +50,6 @@ fn attribute_1_of_table_has_wrong_type(mut conn: PgConnection) {
 
 #[rstest]
 fn generates_custom_scan_for_or(mut conn: PgConnection) {
-    use serde_json::Value;
-
     SimpleProductsTable::setup().execute(&mut conn);
 
     let (plan, ) = "EXPLAIN (ANALYZE, FORMAT JSON) SELECT * FROM paradedb.bm25_search WHERE bm25_search @@@ 'description:keyboard' OR description @@@ 'shoes'".fetch_one::<(Value,)>(&mut conn);
@@ -465,7 +463,7 @@ fn leaky_file_handles(mut conn: PgConnection) {
             .expect("`lsof` command should not fail`");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        eprintln!("stdout: {}", stdout);
+        eprintln!("stdout: {stdout}");
         stdout.contains("/tantivy/")
     }
 
@@ -515,6 +513,57 @@ fn cte_issue_1951(mut conn: PgConnection) {
         order by cte.score desc;
     "#.fetch_result::<(i32, )>(&mut conn).expect("query failed");
     assert_eq!(results.len(), 1);
+}
+
+#[rstest]
+fn without_operator_guc(mut conn: PgConnection) {
+    r#"
+    CALL paradedb.create_bm25_test_table(table_name => 'mock_items', schema_name => 'public');
+
+    CREATE INDEX search_idx ON mock_items
+    USING bm25 (id, description)
+    WITH (key_field='id');
+    "#
+    .execute(&mut conn);
+
+    "SET enable_indexscan TO OFF;".execute(&mut conn);
+
+    fn plan_uses_custom_scan(conn: &mut PgConnection, query_string: &str) -> bool {
+        let (plan,) = format!("EXPLAIN (FORMAT JSON) {query_string}").fetch_one::<(Value,)>(conn);
+        eprintln!("{plan:#?}");
+        format!("{plan:?}").contains("ParadeDB Scan")
+    }
+
+    for custom_scan_without_operator in [true, false] {
+        format!(
+            "SET paradedb.enable_custom_scan_without_operator = {custom_scan_without_operator}"
+        )
+        .execute(&mut conn);
+
+        // Confirm that a plan which doesn't use our operator is affected by the GUC.
+        let uses_custom_scan =
+            plan_uses_custom_scan(&mut conn, "SELECT * FROM mock_items WHERE id = 1");
+        if custom_scan_without_operator {
+            assert!(
+                uses_custom_scan,
+                "Should use the custom scan when the GUC is enabled."
+            );
+        } else {
+            assert!(
+                !uses_custom_scan,
+                "Should not the custom scan when the GUC is disabled."
+            );
+        }
+
+        // And that a plan which does use our operator is not affected by the GUC.
+        let uses_custom_scan =
+            plan_uses_custom_scan(&mut conn, "SELECT * FROM mock_items WHERE id @@@ '1'");
+        assert!(
+            uses_custom_scan,
+            "Should use the custom scan when our operator is used, regardless of \
+            the GUC value ({custom_scan_without_operator})"
+        );
+    }
 }
 
 #[rstest]
@@ -633,6 +682,48 @@ fn stable_limit_and_offset(mut conn: PgConnection) {
         let current = query(offset, 1);
         assert_eq!(expected, current[0]);
     }
+}
+
+#[rstest]
+fn top_n_exits_at_limit(mut conn: PgConnection) {
+    if pg_major_version(&mut conn) < 16 {
+        // Before 16, Postgres would not plan an incremental sort here.
+        return;
+    }
+
+    // When there are more results than the limit will render, but there is no `Limit` node
+    // immediately above us in the plan (in this case, we get an `Incremental Sort` instead due to
+    // the tiebreaker sort, which we can't push down until #2642), Top-N should exit on its own.
+    r#"
+        CREATE TABLE exit_at_limit (id SERIAL8 NOT NULL PRIMARY KEY, message TEXT, severity INTEGER);
+        CREATE INDEX exit_at_limit_index ON exit_at_limit USING bm25 (id, message, severity) WITH (key_field = 'id');
+        INSERT INTO exit_at_limit (message, severity) VALUES ('beer wine cheese a', 1);
+        INSERT INTO exit_at_limit (message, severity) VALUES ('beer wine a', 2);
+        INSERT INTO exit_at_limit (message, severity) VALUES ('beer cheese a', 3);
+        INSERT INTO exit_at_limit (message, severity) VALUES ('beer a', 4);
+        INSERT INTO exit_at_limit (message, severity) VALUES ('wine cheese a', 5);
+        SET max_parallel_workers = 0;
+    "#.execute(&mut conn);
+
+    let (plan,) = r#"
+        EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
+        SELECT * FROM exit_at_limit
+        WHERE message @@@ 'beer'
+        ORDER BY severity, id LIMIT 1;
+    "#
+    .fetch_one::<(Value,)>(&mut conn);
+    eprintln!("{plan:#?}");
+
+    // The Incremental Sort node prevents the Limit node from applying early cutoff, so the custom
+    // scan node must do so itself.
+    assert_eq!(
+        plan.pointer("/0/Plan/Plans/0/Node Type"),
+        Some(&Value::String(String::from("Incremental Sort")))
+    );
+    assert_eq!(
+        plan.pointer("/0/Plan/Plans/0/Plans/0/   Queries"),
+        Some(&Value::Number(1.into()))
+    );
 }
 
 #[rstest]
@@ -880,7 +971,7 @@ fn nested_loop_rescan_issue_2472(mut conn: PgConnection) {
         has_company_15,
         "Results should include user with company_id 15"
     );
-    println!("minimal_results: {:?}", minimal_results);
+    println!("minimal_results: {minimal_results:?}");
     let company_15_result = minimal_results
         .iter()
         .find(|(_, company_id, _, _)| *company_id == 15)
@@ -938,7 +1029,7 @@ fn nested_loop_rescan_issue_2472(mut conn: PgConnection) {
 
     // Due to small data sizes, PostgreSQL might choose not to use parallelism
     // even when the settings allow it, so we don't assert but print info
-    println!("Parallelism indicators in plan: {}", parallel_enabled);
+    println!("Parallelism indicators in plan: {parallel_enabled}");
 
     // First test in parallel mode
     let parallel_complex_results = r#"

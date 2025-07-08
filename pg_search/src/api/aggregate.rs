@@ -5,7 +5,9 @@ use crate::index::reader::index::SearchIndexReader;
 use crate::launch_parallel_process;
 use crate::parallel_worker::mqueue::MessageQueueSender;
 use crate::parallel_worker::ParallelStateManager;
+use crate::parallel_worker::{chunk_range, QueryWorkerStyle, WorkerStyle};
 use crate::parallel_worker::{ParallelProcess, ParallelState, ParallelStateType, ParallelWorker};
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::spinlock::Spinlock;
 use crate::query::SearchQueryInput;
 use pgrx::{check_for_interrupts, default, pg_extern, pg_sys, Json, JsonB, PgRelation};
@@ -105,44 +107,40 @@ impl ParallelAggregation {
 
 struct ParallelAggregationWorker<'a> {
     state: &'a mut State,
-    config: &'a Config,
-    agg_req_bytes: &'a [u8],
-    query_bytes: &'a [u8],
-    segment_ids: &'a [SegmentId],
+    config: Config,
+    aggregation: Aggregations,
+    query: SearchQueryInput,
+    segment_ids: Vec<SegmentId>,
 }
 
-impl ParallelAggregationWorker<'_> {
-    fn checkout_segments(&mut self, worker_number: i32) -> FxHashSet<SegmentId> {
-        /*
-            // thanks, Daniel Lemire:  https://x.com/lemire/status/1925609310274400509
-
-            // N is the total number of elements
-            // M is the number of chunks
-            // i is the index of the chunk (0-indexed)
-            std::pair<size_t, size_t> get_chunk_range_simple(size_t N, size_t M, size_t i) {
-                // Calculate the quotient and remainder
-                size_t quotient = N / M;
-                size_t remainder = N % M;
-                size_t start = quotient * i + (i < remainder ? i : remainder);
-                size_t length = quotient + (i < remainder ? 1 : 0);
-                return {start, length};
-            }
-        */
-        fn chunk_range(n: usize, m: usize, i: usize) -> (usize, usize) {
-            let quotient = n / m;
-            let remainder = n % m;
-            let start = quotient * i + (if i < remainder { i } else { remainder });
-            let length = quotient + if i < remainder { 1 } else { 0 };
-            (start, length)
+impl<'a> ParallelAggregationWorker<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new_local(
+        aggregation: Aggregations,
+        query: SearchQueryInput,
+        segment_ids: Vec<SegmentId>,
+        indexrelid: pg_sys::Oid,
+        solve_mvcc: bool,
+        memory_limit: u64,
+        bucket_limit: u32,
+        state: &'a mut State,
+    ) -> Self {
+        Self {
+            state,
+            config: Config {
+                indexrelid,
+                total_segments: segment_ids.len(),
+                solve_mvcc,
+                memory_limit,
+                bucket_limit,
+            },
+            aggregation,
+            query,
+            segment_ids,
         }
+    }
 
-        let worker_number = worker_number
-            + if unsafe { pg_sys::parallel_leader_participation } {
-                1
-            } else {
-                0
-            };
-
+    fn checkout_segments(&mut self, worker_number: i32) -> FxHashSet<SegmentId> {
         let nworkers = self.state.launched_workers();
         let nsegments = self.config.total_segments;
 
@@ -170,28 +168,30 @@ impl ParallelAggregationWorker<'_> {
 
     fn execute_aggregate(
         &mut self,
-        worker_number: i32,
+        worker_style: QueryWorkerStyle,
     ) -> anyhow::Result<Option<IntermediateAggregationResults>> {
-        let segment_ids = self.checkout_segments(worker_number);
+        let segment_ids = self.checkout_segments(worker_style.worker_number());
         if segment_ids.is_empty() {
             return Ok(None);
         }
-        let agg_req = serde_json::from_slice::<Aggregations>(self.agg_req_bytes)?;
-        let query = serde_json::from_slice::<SearchQueryInput>(self.query_bytes)?;
-
         let indexrel =
-            unsafe { PgRelation::with_lock(self.config.indexrelid, pg_sys::AccessShareLock as _) };
-        let reader =
-            SearchIndexReader::open(&indexrel, MvccSatisfies::ParallelWorker(segment_ids))?;
+            PgSearchRelation::with_lock(self.config.indexrelid, pg_sys::AccessShareLock as _);
+        let reader = SearchIndexReader::open(
+            &indexrel,
+            self.query.clone(),
+            false,
+            MvccSatisfies::ParallelWorker(segment_ids.clone()),
+        )?;
 
         let base_collector = DistributedAggregationCollector::from_aggs(
-            agg_req,
+            self.aggregation.clone(),
             AggregationLimitsGuard::new(
                 Some(self.config.memory_limit),
                 Some(self.config.bucket_limit),
             ),
         );
 
+        let start = std::time::Instant::now();
         let intermediate_results = if self.config.solve_mvcc {
             let heaprel = indexrel
                 .heap_relation()
@@ -202,37 +202,52 @@ impl ParallelAggregationWorker<'_> {
                     pg_sys::GetActiveSnapshot()
                 }),
             );
-            reader.collect(&query, mvcc_collector, false)
+            reader.collect(mvcc_collector)
         } else {
-            reader.collect(&query, base_collector, false)
+            reader.collect(base_collector)
         };
+        pgrx::debug1!(
+            "Worker #{}: collected {segment_ids:?} in {:?}",
+            unsafe { pg_sys::ParallelWorkerNumber },
+            start.elapsed()
+        );
         Ok(Some(intermediate_results))
     }
 }
 
 impl ParallelWorker for ParallelAggregationWorker<'_> {
-    fn new(state_manager: ParallelStateManager) -> Self {
+    fn new_parallel_worker(state_manager: ParallelStateManager) -> Self {
+        let state = state_manager
+            .object::<State>(0)
+            .expect("wrong type for state")
+            .expect("missing state value");
+        let config = state_manager
+            .object::<Config>(1)
+            .expect("wrong type for config")
+            .expect("missing config value");
+        let agg_req_bytes = state_manager
+            .slice::<u8>(2)
+            .expect("wrong type for agg_req_bytes")
+            .expect("missing agg_req_bytes value");
+        let query_bytes = state_manager
+            .slice::<u8>(3)
+            .expect("wrong type for query_bytes")
+            .expect("missing query_bytes value");
+        let segment_ids = state_manager
+            .slice::<SegmentId>(4)
+            .expect("wrong type for segment_ids")
+            .expect("missing segment_ids value");
+
+        let aggregation = serde_json::from_slice::<Aggregations>(agg_req_bytes)
+            .expect("agg_req_bytes should deserialize into an Aggregations");
+        let query = serde_json::from_slice::<SearchQueryInput>(query_bytes)
+            .expect("query_bytes should deserialize into an SearchQueryInput");
         Self {
-            state: state_manager
-                .object(0)
-                .expect("wrong type for state")
-                .expect("missing state value"),
-            config: state_manager
-                .object(1)
-                .expect("wrong type for config")
-                .expect("missing config value"),
-            agg_req_bytes: state_manager
-                .slice(2)
-                .expect("wrong type for agg_req_bytes")
-                .expect("missing agg_req_bytes value"),
-            query_bytes: state_manager
-                .slice(3)
-                .expect("wrong type for query_bytes")
-                .expect("missing query_bytes value"),
-            segment_ids: state_manager
-                .slice(4)
-                .expect("wrong type for segment_ids")
-                .expect("missing segment_ids value"),
+            state,
+            config: *config,
+            aggregation,
+            query,
+            segment_ids: segment_ids.to_vec(),
         }
     }
 
@@ -243,7 +258,9 @@ impl ParallelWorker for ParallelAggregationWorker<'_> {
             std::thread::yield_now();
         }
 
-        if let Some(intermediate_results) = self.execute_aggregate(worker_number)? {
+        if let Some(intermediate_results) =
+            self.execute_aggregate(QueryWorkerStyle::ParallelWorker(worker_number))?
+        {
             let bytes = postcard::to_allocvec(&intermediate_results)?;
             Ok(mq_sender.send(bytes)?)
         } else {
@@ -262,7 +279,9 @@ pub fn aggregate(
     bucket_limit: default!(i64, 65000),
 ) -> Result<JsonB, Box<dyn Error>> {
     unsafe {
-        let reader = SearchIndexReader::open(&index, MvccSatisfies::Snapshot)?;
+        let index = PgSearchRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _);
+        let reader =
+            SearchIndexReader::open(&index, query.clone(), false, MvccSatisfies::Snapshot)?;
         let agg_req = serde_json::from_value(agg.0)?;
         let process = ParallelAggregation::new(
             index.oid(),
@@ -275,64 +294,109 @@ pub fn aggregate(
         )?;
 
         // limit number of workers to the number of segments
-        let nworkers =
+        let mut nworkers =
             (pg_sys::max_parallel_workers_per_gather as usize).min(reader.segment_readers().len());
-        let mut process = launch_parallel_process!(
+
+        if nworkers > 0 && pg_sys::parallel_leader_participation {
+            // make sure to account for the leader being a worker too
+            nworkers -= 1;
+        }
+        pgrx::debug1!(
+            "requesting {nworkers} parallel workers, with parallel_leader_participation={}",
+            *std::ptr::addr_of!(pg_sys::parallel_leader_participation)
+        );
+        if let Some(mut process) = launch_parallel_process!(
             ParallelAggregation<ParallelAggregationWorker>,
             process,
+            WorkerStyle::Query,
             nworkers,
             16384
-        )
-        .expect("should be able to launch parallel process");
+        ) {
+            // signal our workers with the number of workers actually launched
+            // they need this before they can begin checking out the correct segment counts
+            let mut nlaunched = process.launched_workers();
+            pgrx::debug1!("launched {nlaunched} workers");
+            if pg_sys::parallel_leader_participation {
+                nlaunched += 1;
+                pgrx::debug1!(
+                    "with parallel_leader_participation=true, actual worker count={nlaunched}"
+                );
+            }
 
-        // signal our workers with the number of workers actually launched
-        // they need this before they can begin checking out the correct segment counts
-        let mut nlaunched = process.launched_workers();
-        if pg_sys::parallel_leader_participation {
-            nlaunched += 1;
-        }
+            process
+                .state_manager_mut()
+                .object::<State>(0)?
+                .unwrap()
+                .set_launched_workers(nlaunched);
 
-        process
-            .state_manager_mut()
-            .object::<State>(0)?
-            .unwrap()
-            .set_launched_workers(nlaunched);
+            // leader participation
+            let mut agg_results = Vec::with_capacity(nlaunched);
+            if pg_sys::parallel_leader_participation {
+                let mut worker =
+                    ParallelAggregationWorker::new_parallel_worker(*process.state_manager());
+                if let Some(result) = worker.execute_aggregate(QueryWorkerStyle::ParallelLeader)? {
+                    agg_results.push(Ok(result));
+                }
+            }
 
-        // leader participation
-        let mut agg_results = Vec::with_capacity(nlaunched);
-        if pg_sys::parallel_leader_participation {
-            let mut worker = ParallelAggregationWorker::new(*process.state_manager());
-            if let Some(result) = worker.execute_aggregate(-1)? {
-                agg_results.push(Ok(result));
+            // wait for workers to finish, collecting their intermediate aggregate results
+            for (_worker_number, message) in process {
+                let worker_results =
+                    postcard::from_bytes::<IntermediateAggregationResults>(&message)?;
+
+                agg_results.push(Ok(worker_results));
+            }
+
+            // have tantivy finalize the intermediate results from each worker
+            let merged = {
+                let collector = DistributedAggregationCollector::from_aggs(
+                    agg_req.clone(),
+                    AggregationLimitsGuard::new(
+                        Some(memory_limit.try_into()?),
+                        Some(bucket_limit.try_into()?),
+                    ),
+                );
+                collector.merge_fruits(agg_results)?.into_final_result(
+                    agg_req,
+                    AggregationLimitsGuard::new(
+                        Some(memory_limit.try_into()?),
+                        Some(bucket_limit.try_into()?),
+                    ),
+                )?
+            };
+
+            Ok(JsonB(serde_json::to_value(merged)?))
+        } else {
+            // couldn't launch any workers, so we just execute the aggregate right here in this backend
+            let segment_ids = reader.segment_ids();
+            let mut state = State {
+                mutex: Spinlock::default(),
+                nlaunched: 1,
+                remaining_segments: segment_ids.len(),
+            };
+            let mut worker = ParallelAggregationWorker::new_local(
+                agg_req.clone(),
+                query,
+                segment_ids,
+                index.oid(),
+                solve_mvcc,
+                memory_limit as _,
+                bucket_limit as _,
+                &mut state,
+            );
+            if let Some(agg_results) = worker.execute_aggregate(QueryWorkerStyle::NonParallel)? {
+                let result = agg_results.into_final_result(
+                    agg_req,
+                    AggregationLimitsGuard::new(
+                        Some(memory_limit.try_into()?),
+                        Some(bucket_limit.try_into()?),
+                    ),
+                )?;
+                Ok(JsonB(serde_json::to_value(result)?))
+            } else {
+                Ok(JsonB(serde_json::Value::Null))
             }
         }
-
-        // wait for workers to finish, collecting their intermediate aggregate results
-        for (_worker_number, message) in process {
-            let worker_results = postcard::from_bytes::<IntermediateAggregationResults>(&message)?;
-
-            agg_results.push(Ok(worker_results));
-        }
-
-        // have tantivy finalize the intermediate results from each worker
-        let merged = {
-            let collector = DistributedAggregationCollector::from_aggs(
-                agg_req.clone(),
-                AggregationLimitsGuard::new(
-                    Some(memory_limit.try_into()?),
-                    Some(bucket_limit.try_into()?),
-                ),
-            );
-            collector.merge_fruits(agg_results)?.into_final_result(
-                agg_req,
-                AggregationLimitsGuard::new(
-                    Some(memory_limit.try_into()?),
-                    Some(bucket_limit.try_into()?),
-                ),
-            )?
-        };
-
-        Ok(JsonB(serde_json::to_value(merged)?))
     }
 }
 
@@ -366,6 +430,8 @@ pub mod mvcc_collector {
                 inner: self.inner.for_segment(segment_local_id, segment)?,
                 lock: self.lock.clone(),
                 ctid_ff: FFType::new(segment.fast_fields(), "ctid"),
+                ctids_buffer: Vec::new(),
+                filtered_buffer: Vec::new(),
             })
         }
 
@@ -395,6 +461,8 @@ pub mod mvcc_collector {
         inner: SC,
         lock: Arc<Mutex<TSVisibilityChecker>>,
         ctid_ff: FFType,
+        ctids_buffer: Vec<Option<u64>>,
+        filtered_buffer: Vec<u32>,
     }
     unsafe impl<C: SegmentCollector> Send for MVCCFilterSegmentCollector<C> {}
     unsafe impl<C: SegmentCollector> Sync for MVCCFilterSegmentCollector<C> {}
@@ -410,25 +478,25 @@ pub mod mvcc_collector {
         }
 
         fn collect_block(&mut self, docs: &[DocId]) {
-            let ctids = docs
-                .iter()
-                .map(|doc_id| {
-                    self.ctid_ff
-                        .as_u64(*doc_id)
-                        .expect("ctid should be present")
-                })
-                .collect::<Vec<_>>();
-            let mut filtered = Vec::with_capacity(docs.len());
+            // Get the ctids for these docs.
+            if self.ctids_buffer.len() < docs.len() {
+                self.ctids_buffer.resize(docs.len(), None);
+            }
+            self.ctid_ff
+                .as_u64s(docs, &mut self.ctids_buffer[..docs.len()]);
 
+            // Determine which ctids are visible.
+            self.filtered_buffer.clear();
             let mut vischeck = self.lock.lock();
-            for (doc, ctid) in docs.iter().zip(ctids.iter()) {
-                if vischeck.is_visible(*ctid) {
-                    filtered.push(*doc);
+            for (doc, ctid) in docs.iter().zip(self.ctids_buffer.iter()) {
+                let ctid = ctid.expect("ctid should be present");
+                if vischeck.is_visible(ctid) {
+                    self.filtered_buffer.push(*doc);
                 }
             }
             drop(vischeck);
 
-            self.inner.collect_block(&filtered);
+            self.inner.collect_block(&self.filtered_buffer);
         }
 
         fn harvest(self) -> Self::Fruit {

@@ -19,31 +19,31 @@ pub mod mixed;
 pub mod numeric;
 pub mod string;
 
-use crate::api::index::FieldName;
+use crate::api::FieldName;
 use crate::api::HashSet;
 use crate::gucs;
 use crate::index::fast_fields_helper::{FFHelper, FastFieldType, WhichFastField};
-use crate::index::mvcc::MvccSatisfies;
-use crate::index::reader::index::{SearchIndexReader, SearchResults};
+use crate::index::reader::index::SearchResults;
 use crate::nodecast;
 use crate::postgres::customscan::builders::custom_state::CustomScanStateWrapper;
 use crate::postgres::customscan::explainer::Explainer;
 use crate::postgres::customscan::pdbscan::privdat::PrivateData;
 use crate::postgres::customscan::pdbscan::projections::score::{score_funcoid, uses_scores};
 use crate::postgres::customscan::pdbscan::{scan_state::PdbScanState, PdbScan};
+use crate::postgres::rel::PgSearchRelation;
 use crate::schema::SearchIndexSchema;
 use itertools::Itertools;
 use pgrx::pg_sys::CustomScanState;
-use pgrx::{pg_sys, IntoDatum, PgList, PgOid, PgRelation, PgTupleDesc};
+use pgrx::{pg_sys, IntoDatum, PgList, PgOid, PgTupleDesc};
 use std::rc::Rc;
 use tantivy::columnar::StrColumn;
 use tantivy::termdict::TermOrdinal;
-use tantivy::DocAddress;
+use tantivy::{DocAddress, Index, ReloadPolicy};
 
 const NULL_TERM_ORDINAL: TermOrdinal = u64::MAX;
 
 pub struct FastFieldExecState {
-    heaprel: pg_sys::Relation,
+    heaprel: Option<PgSearchRelation>,
     tupdesc: Option<PgTupleDesc<'static>>,
 
     /// Execution time WhichFastFields.
@@ -75,7 +75,7 @@ impl Drop for FastFieldExecState {
 impl FastFieldExecState {
     pub fn new(which_fast_fields: Vec<WhichFastField>) -> Self {
         Self {
-            heaprel: std::ptr::null_mut(),
+            heaprel: None,
             tupdesc: None,
             which_fast_fields,
             ffhelper: Default::default(),
@@ -89,7 +89,7 @@ impl FastFieldExecState {
 
     fn init(&mut self, state: &mut PdbScanState, cstate: *mut CustomScanState) {
         unsafe {
-            self.heaprel = state.heaprel();
+            self.heaprel = Some(Clone::clone(state.heaprel()));
             self.tupdesc = Some(PgTupleDesc::from_pg_unchecked(
                 (*cstate).ss.ps.ps_ResultTupleDesc,
             ));
@@ -161,7 +161,7 @@ pub unsafe fn collect_fast_fields(
     referenced_columns: &HashSet<pg_sys::AttrNumber>,
     rti: pg_sys::Index,
     schema: &SearchIndexSchema,
-    heaprel: &PgRelation,
+    heaprel: &PgSearchRelation,
     is_execution_time: bool,
 ) -> Vec<WhichFastField> {
     let fast_fields = pullup_fast_fields(
@@ -183,7 +183,7 @@ fn collect_fast_field_try_for_attno(
     processed_attnos: &mut HashSet<pg_sys::AttrNumber>,
     matches: &mut Vec<WhichFastField>,
     tupdesc: &PgTupleDesc<'_>,
-    heaprel: &PgRelation,
+    heaprel: &PgSearchRelation,
     schema: &SearchIndexSchema,
 ) -> bool {
     // Skip if we've already processed this attribute number
@@ -223,15 +223,18 @@ fn collect_fast_field_try_for_attno(
 
             // Get attribute info - use if let to handle missing attributes gracefully
             if let Some(att) = tupdesc.get((attno - 1) as usize) {
-                if schema.is_fast_field(&FieldName::from(att.name())) {
-                    let ff_type = if att.type_oid().value() == pg_sys::TEXTOID
-                        || att.type_oid().value() == pg_sys::VARCHAROID
-                    {
-                        FastFieldType::String
-                    } else {
-                        FastFieldType::Numeric
-                    };
-                    matches.push(WhichFastField::Named(att.name().to_string(), ff_type));
+                if let Some(search_field) = schema.search_field(att.name()) {
+                    if search_field.is_fast() {
+                        let ff_type = if att.type_oid().value() == pg_sys::TEXTOID
+                            || att.type_oid().value() == pg_sys::VARCHAROID
+                            || att.type_oid().value() == pg_sys::UUIDOID
+                        {
+                            FastFieldType::String
+                        } else {
+                            FastFieldType::Numeric
+                        };
+                        matches.push(WhichFastField::Named(att.name().to_string(), ff_type));
+                    }
                 }
             }
             // If the attribute doesn't exist in this relation, just continue
@@ -246,7 +249,7 @@ pub unsafe fn pullup_fast_fields(
     node: *mut pg_sys::List,
     referenced_columns: &HashSet<pg_sys::AttrNumber>,
     schema: &SearchIndexSchema,
-    heaprel: &PgRelation,
+    heaprel: &PgSearchRelation,
     rti: pg_sys::Index,
     is_execution_time: bool,
 ) -> Option<Vec<WhichFastField>> {
@@ -304,10 +307,7 @@ pub unsafe fn pullup_fast_fields(
                 let restype = (*te.expr).type_;
                 let resno = te.resno;
                 let isjunk = te.resjunk;
-                format!(
-                    "{}(resno={}, restype={:?}, resjunk={})",
-                    base, resno, restype, isjunk
-                )
+                format!("{base}(resno={resno}, restype={restype:?}, resjunk={isjunk})")
             };
             let resname = if (*te).resname.is_null() {
                 create_resname("NONAME", &*te)
@@ -539,15 +539,15 @@ pub fn explain(state: &CustomScanStateWrapper<PdbScan>, explainer: &mut Explaine
     }
 }
 
-pub fn estimate_cardinality(indexrel: &PgRelation, field: &FieldName) -> Option<usize> {
-    let reader = SearchIndexReader::open(indexrel, MvccSatisfies::Snapshot)
-        .expect("estimate_cardinality: should be able to open SearchIndexReader");
+pub fn estimate_cardinality(index: &Index, field: &FieldName) -> Option<usize> {
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .expect("estimate_cardinality: should be able to open the IndexReader");
     let searcher = reader.searcher();
-    let largest_segment_reader = searcher
-        .segment_readers()
-        .iter()
-        .max_by_key(|sr| sr.num_docs())
-        .unwrap();
+    debug_assert!(searcher.segment_readers().len() == 1, "estimate_cardinality(): expected an index with only one segment, which is assumed to be the largest segment by num_docs");
+    let largest_segment_reader = searcher.segment_reader(0);
 
     Some(
         largest_segment_reader

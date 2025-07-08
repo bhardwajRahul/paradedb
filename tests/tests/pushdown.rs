@@ -144,6 +144,7 @@ fn pushdown(mut conn: PgConnection) {
     "SET enable_indexscan TO off;".execute(&mut conn);
     "SET enable_bitmapscan TO off;".execute(&mut conn);
     "SET max_parallel_workers TO 0;".execute(&mut conn);
+    "SET paradedb.enable_custom_scan_without_operator TO on;".execute(&mut conn);
 
     for operator in OPERATORS {
         for [sqltype, default] in TYPES {
@@ -153,8 +154,7 @@ fn pushdown(mut conn: PgConnection) {
                 EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
                 SELECT count(*)
                 FROM test
-                WHERE {sqlname} {operator} {default}::{sqltype}
-                  AND id @@@ '1';
+                WHERE {sqlname} {operator} {default}::{sqltype};
             "#
             );
 
@@ -177,8 +177,7 @@ fn pushdown(mut conn: PgConnection) {
                 EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
                 SELECT count(*)
                 FROM test
-                WHERE {sqlname} = true
-                  AND id @@@ '1';
+                WHERE {sqlname} = true;
             "#
         );
 
@@ -198,8 +197,7 @@ fn pushdown(mut conn: PgConnection) {
                 EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON)
                 SELECT count(*)
                 FROM test
-                WHERE {sqlname} = false
-                  AND id @@@ '1';
+                WHERE {sqlname} = false;
             "#
         );
 

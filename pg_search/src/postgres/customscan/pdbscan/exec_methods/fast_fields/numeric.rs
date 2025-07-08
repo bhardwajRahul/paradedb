@@ -48,12 +48,11 @@ impl ExecMethod for NumericFastFieldExecState {
     fn query(&mut self, state: &mut PdbScanState) -> bool {
         if let Some(parallel_state) = state.parallel_state {
             if let Some(segment_id) = unsafe { checkout_segment(parallel_state) } {
-                self.inner.search_results = state.search_reader.as_ref().unwrap().search_segments(
-                    state.need_scores(),
-                    [segment_id].into_iter(),
-                    state.search_query_input(),
-                    0,
-                );
+                self.inner.search_results = state
+                    .search_reader
+                    .as_ref()
+                    .unwrap()
+                    .search_segments([segment_id].into_iter(), 0);
                 return true;
             }
 
@@ -65,12 +64,7 @@ impl ExecMethod for NumericFastFieldExecState {
             false
         } else {
             // not parallel, first time query
-            self.inner.search_results = state.search_reader.as_ref().unwrap().search(
-                state.need_scores(),
-                false,
-                state.search_query_input(),
-                state.limit,
-            );
+            self.inner.search_results = state.search_reader.as_ref().unwrap().search(state.limit);
             self.inner.did_query = true;
             true
         }
@@ -81,11 +75,16 @@ impl ExecMethod for NumericFastFieldExecState {
             match self.inner.search_results.next() {
                 None => ExecState::Eof,
                 Some((scored, doc_address)) => {
+                    let heaprel = self
+                        .inner
+                        .heaprel
+                        .as_ref()
+                        .expect("NumericFieldsExecState: heaprel should be initialized");
                     let slot = self.inner.slot;
                     let natts = (*(*slot).tts_tupleDescriptor).natts as usize;
 
                     crate::postgres::utils::u64_to_item_pointer(scored.ctid, &mut (*slot).tts_tid);
-                    (*slot).tts_tableOid = (*self.inner.heaprel).rd_id;
+                    (*slot).tts_tableOid = heaprel.oid();
 
                     let blockno = item_pointer_get_block_number(&(*slot).tts_tid);
                     let is_visible = if blockno == self.inner.blockvis.0 {
@@ -94,11 +93,8 @@ impl ExecMethod for NumericFastFieldExecState {
                     } else {
                         // new block so check its visibility
                         self.inner.blockvis.0 = blockno;
-                        self.inner.blockvis.1 = is_block_all_visible(
-                            self.inner.heaprel,
-                            &mut self.inner.vmbuff,
-                            blockno,
-                        );
+                        self.inner.blockvis.1 =
+                            is_block_all_visible(heaprel, &mut self.inner.vmbuff, blockno);
                         self.inner.blockvis.1
                     };
 

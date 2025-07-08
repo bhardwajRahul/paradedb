@@ -17,6 +17,7 @@
 
 #![allow(clippy::unnecessary_cast)] // helps with integer casting differences between postgres versions
 mod exec_methods;
+mod opexpr;
 pub mod parallel;
 mod privdat;
 mod projections;
@@ -28,8 +29,9 @@ mod solve_expr;
 use crate::api::operator::{anyelement_query_input_opoid, estimate_selectivity};
 use crate::api::Cardinality;
 use crate::api::{HashMap, HashSet};
+use crate::gucs;
 use crate::index::fast_fields_helper::WhichFastField;
-use crate::index::mvcc::{MVCCDirectory, MvccSatisfies};
+use crate::index::mvcc::MvccSatisfies;
 use crate::index::reader::index::SearchIndexReader;
 use crate::postgres::customscan::builders::custom_path::{
     CustomPathBuilder, ExecMethodType, Flags, OrderByStyle, RestrictInfoType, SortDirection,
@@ -54,11 +56,14 @@ use crate::postgres::customscan::pdbscan::projections::snippet::{
 use crate::postgres::customscan::pdbscan::projections::{
     inject_placeholders, maybe_needs_const_projections, pullout_funcexprs,
 };
-use crate::postgres::customscan::pdbscan::qual_inspect::extract_quals;
+use crate::postgres::customscan::pdbscan::qual_inspect::{
+    extract_join_predicates, extract_quals, Qual, QualExtractState,
+};
 use crate::postgres::customscan::pdbscan::scan_state::PdbScanState;
 use crate::postgres::customscan::{self, CustomScan, CustomScanState};
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::rel_get_bm25_index;
-use crate::postgres::var::{fieldname_from_var, find_var_relation};
+use crate::postgres::var::find_var_relation;
 use crate::postgres::visibility_checker::VisibilityChecker;
 use crate::query::SearchQueryInput;
 use crate::schema::SearchIndexSchema;
@@ -68,6 +73,7 @@ use pgrx::pg_sys::CustomExecMethods;
 use pgrx::{direct_function_call, pg_sys, IntoDatum, PgList, PgMemoryContexts, PgRelation};
 use std::ffi::CStr;
 use std::ptr::addr_of_mut;
+use std::sync::atomic::Ordering;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::Index;
 
@@ -88,26 +94,29 @@ impl PdbScan {
             .custom_state()
             .indexrel
             .as_ref()
-            .map(|indexrel| unsafe { PgRelation::from_pg(*indexrel) })
             .expect("custom_state.indexrel should already be open");
 
-        let search_reader = SearchIndexReader::open(&indexrel, unsafe {
-            if pg_sys::ParallelWorkerNumber == -1 {
-                // the leader only sees snapshot-visible segments
-                MvccSatisfies::Snapshot
-            } else {
-                // the workers have their own rules, which is literally every segment
-                // this is because the workers pick a specific segment to query that
-                // is known to be held open/pinned by the leader but might not pass a ::Snapshot
-                // visibility test due to concurrent merges/garbage collects
-                MvccSatisfies::ParallelWorker(list_segment_ids(
-                    state.custom_state().parallel_state.expect(
-                        "Parallel Custom Scan rescan_custom_scan should have a parallel state",
-                    ),
-                ))
-            }
-        })
-        .expect("should be able to open the search index reader");
+        let search_query_input = state.custom_state().search_query_input();
+        let need_scores = state.custom_state().need_scores();
+
+        let search_reader =
+            SearchIndexReader::open(indexrel, search_query_input.clone(), need_scores, unsafe {
+                if pg_sys::ParallelWorkerNumber == -1 {
+                    // the leader only sees snapshot-visible segments
+                    MvccSatisfies::Snapshot
+                } else {
+                    // the workers have their own rules, which is literally every segment
+                    // this is because the workers pick a specific segment to query that
+                    // is known to be held open/pinned by the leader but might not pass a ::Snapshot
+                    // visibility test due to concurrent merges/garbage collects
+                    MvccSatisfies::ParallelWorker(list_segment_ids(
+                        state.custom_state().parallel_state.expect(
+                            "Parallel Custom Scan rescan_custom_scan should have a parallel state",
+                        ),
+                    ))
+                }
+            })
+            .expect("should be able to open the search index reader");
         state.custom_state_mut().search_reader = Some(search_reader);
 
         let csstate = addr_of_mut!(state.csstate);
@@ -122,16 +131,33 @@ impl PdbScan {
                 .snippet_generators
                 .drain()
                 .collect();
+
+            // Pre-compute enhanced queries for snippet generation if we have join predicates
+            let enhanced_query_for_snippets =
+                if let Some(ref join_predicate) = state.custom_state().join_predicates {
+                    // Combine base query with join predicate for snippet generation
+                    let base_query = state.custom_state().search_query_input();
+                    Some(SearchQueryInput::Boolean {
+                        must: vec![base_query.clone()],
+                        should: vec![join_predicate.clone()],
+                        must_not: vec![],
+                    })
+                } else {
+                    None
+                };
+
             for (snippet_type, generator) in &mut snippet_generators {
+                // Use enhanced query if available, otherwise use base query
+                let query_to_use = enhanced_query_for_snippets
+                    .as_ref()
+                    .unwrap_or_else(|| state.custom_state().search_query_input());
+
                 let mut new_generator = state
                     .custom_state()
                     .search_reader
                     .as_ref()
                     .unwrap()
-                    .snippet_generator(
-                        snippet_type.field(),
-                        state.custom_state().search_query_input(),
-                    );
+                    .snippet_generator(snippet_type.field().root(), query_to_use.clone());
 
                 // If SnippetType::Positions, set max_num_chars to u32::MAX because the entire doc must be considered
                 // This assumes text fields can be no more than u32::MAX bytes
@@ -181,6 +207,85 @@ impl PdbScan {
             // Base cases: primitive values don't need processing
             _ => {}
         }
+    }
+
+    unsafe fn extract_all_possible_quals(
+        builder: &mut CustomPathBuilder<PrivateData>,
+        root: *mut pg_sys::PlannerInfo,
+        rti: pg_sys::Index,
+        restrict_info: PgList<pg_sys::RestrictInfo>,
+        pdbopoid: pg_sys::Oid,
+        ri_type: RestrictInfoType,
+        schema: &SearchIndexSchema,
+    ) -> (Option<Qual>, RestrictInfoType, PgList<pg_sys::RestrictInfo>) {
+        let mut state = QualExtractState::default();
+        let mut quals = extract_quals(
+            root,
+            rti,
+            restrict_info.as_ptr().cast(),
+            pdbopoid,
+            ri_type,
+            schema,
+            false, // Base relation quals should not convert external to all
+            &mut state,
+        );
+
+        // If we couldn't push down quals, try to push down quals from the join
+        // This is only done if we have a join predicate, and only if we have used our operator
+        let (quals, ri_type, restrict_info) = if quals.is_none() {
+            let joinri: PgList<pg_sys::RestrictInfo> =
+                PgList::from_pg(builder.args().rel().joininfo);
+            let mut quals = extract_quals(
+                root,
+                rti,
+                joinri.as_ptr().cast(),
+                anyelement_query_input_opoid(),
+                RestrictInfoType::Join,
+                schema,
+                true, // Join quals should convert external to all
+                &mut state,
+            );
+
+            let quals = Self::handle_heap_expr_optimization(&state, &mut quals, root, rti);
+
+            // If we have found something to push down in the join, or if we have found something to
+            // push down in the base relation, then we can use the join quals
+            if state.uses_tantivy_to_query {
+                (quals, RestrictInfoType::Join, joinri)
+            } else {
+                (None, ri_type, restrict_info)
+            }
+        } else {
+            let quals = Self::handle_heap_expr_optimization(&state, &mut quals, root, rti);
+            (quals, ri_type, restrict_info)
+        };
+
+        // Finally, decide whether we can actually use the extracted quals.
+        if state.uses_our_operator || gucs::enable_custom_scan_without_operator() {
+            (quals, ri_type, restrict_info)
+        } else {
+            (None, ri_type, restrict_info)
+        }
+    }
+
+    unsafe fn handle_heap_expr_optimization(
+        state: &QualExtractState,
+        quals: &mut Option<Qual>,
+        root: *mut pg_sys::PlannerInfo,
+        rti: pg_sys::Index,
+    ) -> Option<Qual> {
+        if state.uses_heap_expr && !state.uses_our_operator {
+            return None;
+        }
+
+        // Apply HeapExpr optimization to the base relation quals
+        if let Some(ref mut q) = quals {
+            let rte = pg_sys::rt_fetch(rti, (*(*root).parse).rtable);
+            let relation_oid = (*rte).relid;
+            qual_inspect::optimize_quals_with_heap_expr(q);
+        }
+
+        quals.clone()
     }
 }
 
@@ -233,9 +338,13 @@ impl CustomScan for PdbScan {
             let root = builder.args().root;
             let rel = builder.args().rel;
 
-            let directory = MVCCDirectory::snapshot(bm25_index.oid());
+            let directory = MvccSatisfies::LargestSegment.directory(&bm25_index);
+            let segment_count = directory.total_segment_count(); // return value only valid after the index has been opened
             let index = Index::open(directory).expect("custom_scan: should be able to open index");
-            let schema = SearchIndexSchema::open(index.schema(), &bm25_index);
+            let segment_count = segment_count.load(Ordering::Relaxed);
+            let schema = bm25_index
+                .schema()
+                .expect("custom_scan: should have a schema");
             let pathkey = pullup_orderby_pathkey(&mut builder, rti, &schema, root);
 
             #[cfg(any(feature = "pg14", feature = "pg15"))]
@@ -295,24 +404,15 @@ impl CustomScan for PdbScan {
             //
             // look for quals we can support
             //
-            let mut uses_our_operator = false;
-            let quals = extract_quals(
+            let (quals, ri_type, restrict_info) = Self::extract_all_possible_quals(
+                &mut builder,
                 root,
                 rti,
-                restrict_info.as_ptr().cast(),
+                restrict_info,
                 anyelement_query_input_opoid(),
                 ri_type,
                 &schema,
-                &mut uses_our_operator,
             );
-
-            if !uses_our_operator {
-                // for now, we're not going to submit our custom scan for queries that don't also
-                // use our `@@@` operator.  Perhaps in the future we can do this, but we don't want to
-                // circumvent Postgres' other possible plans that might do index scans over a btree
-                // index or something
-                return None;
-            }
 
             let Some(quals) = quals else {
                 // if we are not able to push down all of the quals, then do not propose the custom
@@ -320,6 +420,16 @@ impl CustomScan for PdbScan {
                 // to a join, and would require more planning).
                 return None;
             };
+
+            // Check if this is a partial index and if the query is compatible with it
+            if !bm25_index.rd_indpred.is_null() {
+                // This is a partial index - we need to check if the query can be satisfied by it
+                if !quals.is_query_compatible_with_partial_index() {
+                    // The query cannot be satisfied by this partial index, fall back to heap scan
+                    return None;
+                }
+            }
+
             let query = SearchQueryInput::from(&quals);
             let norm_selec = if restrict_info.len() == 1 {
                 (*restrict_info.get_ptr(0).unwrap()).norm_selec
@@ -346,7 +456,7 @@ impl CustomScan for PdbScan {
                 PARAMETERIZED_SELECTIVITY
             } else {
                 // ask the index
-                estimate_selectivity(&bm25_index, &query).unwrap_or(UNKNOWN_SELECTIVITY)
+                estimate_selectivity(&bm25_index, query.clone()).unwrap_or(UNKNOWN_SELECTIVITY)
             };
 
             // we must use this path if we need to do const projections for scores or snippets
@@ -358,12 +468,7 @@ impl CustomScan for PdbScan {
             builder.custom_private().set_range_table_index(rti);
             builder.custom_private().set_query(query);
             builder.custom_private().set_limit(limit);
-            builder.custom_private().set_segment_count(
-                index
-                    .searchable_segments()
-                    .map(|segments| segments.len())
-                    .unwrap_or(0),
-            );
+            builder.custom_private().set_segment_count(segment_count);
 
             if is_topn && pathkey.is_some() {
                 let pathkey = pathkey.as_ref().unwrap();
@@ -394,7 +499,6 @@ impl CustomScan for PdbScan {
             }
 
             let nworkers = if (*builder.args().rel).consider_parallel {
-                let segment_count = index.searchable_segments().unwrap_or_default().len();
                 compute_nworkers(limit, segment_count, builder.custom_private().is_sorted())
             } else {
                 0
@@ -416,7 +520,7 @@ impl CustomScan for PdbScan {
                     let cardinality = {
                         let estimate = if let OrderByStyle::Field(_, field) = &pathkey {
                             // NB:  '4' is a magic number
-                            fast_fields::estimate_cardinality(&bm25_index, field).unwrap_or(0) * 4
+                            fast_fields::estimate_cardinality(&index, field).unwrap_or(0) * 4
                         } else {
                             0
                         };
@@ -532,7 +636,7 @@ impl CustomScan for PdbScan {
                     builder.args().root,
                 );
 
-                for (funcexpr, var) in func_vars_at_level {
+                for (funcexpr, var, attname) in func_vars_at_level {
                     // if we have a tlist, then we need to add the specific function that uses
                     // a Var at our level to that tlist.
                     //
@@ -549,12 +653,37 @@ impl CustomScan for PdbScan {
 
                     // track a triplet of (varno, varattno, attname) as 3 individual
                     // entries in the `attname_lookup` List
-                    let (heaprelid, varattno, _) = find_var_relation(var, builder.args().root);
-                    if let Some(attname) = fieldname_from_var(heaprelid, var, varattno) {
-                        attname_lookup.insert(((*var).varno, (*var).varattno), attname);
-                    }
+                    attname_lookup.insert(((*var).varno, (*var).varattno), attname);
                 }
             }
+
+            // Extract join-level snippet predicates for this relation
+            // Get values we need before the mutable borrow
+
+            // Extract the indexrelid early to avoid borrow checker issues later
+            let indexrelid = private_data.indexrelid().expect("indexrelid should be set");
+            let indexrel = PgSearchRelation::with_lock(indexrelid, pg_sys::AccessShareLock as _);
+            let directory = MvccSatisfies::Snapshot.directory(&indexrel);
+            let index = Index::open(directory)
+                .expect("should be able to open index for snippet extraction");
+            let schema = indexrel.schema().expect("should have a schema");
+
+            let base_query = builder
+                .custom_private()
+                .query()
+                .clone()
+                .expect("should have a SearchQueryInput");
+            let join_predicates = extract_join_predicates(
+                builder.args().root,
+                rti as pg_sys::Index,
+                anyelement_query_input_opoid(),
+                &schema,
+                &base_query,
+            );
+
+            builder
+                .custom_private_mut()
+                .set_join_predicates(join_predicates);
 
             builder
                 .custom_private_mut()
@@ -576,6 +705,10 @@ impl CustomScan for PdbScan {
                 .indexrelid()
                 .expect("indexrelid should have a value");
 
+            builder
+                .custom_state()
+                .open_relations(pg_sys::AccessShareLock as _);
+
             builder.custom_state().execution_rti =
                 (*builder.args().cscan).scan.scanrelid as pg_sys::Index;
 
@@ -588,16 +721,6 @@ impl CustomScan for PdbScan {
             builder.custom_state().limit = builder.custom_private().limit();
             builder.custom_state().sort_field = builder.custom_private().sort_field();
             builder.custom_state().sort_direction = builder.custom_private().sort_direction();
-
-            // store our query into our custom state too
-            let base_query = builder
-                .custom_private()
-                .query()
-                .clone()
-                .expect("should have a SearchQueryInput");
-            builder
-                .custom_state()
-                .set_base_search_query_input(base_query);
 
             builder.custom_state().segment_count = builder.custom_private().segment_count();
             builder.custom_state().var_attname_lookup = builder
@@ -619,6 +742,52 @@ impl CustomScan for PdbScan {
                 score_funcoid,
                 builder.custom_state().execution_rti,
             );
+
+            // Store join snippet predicates in the scan state
+            builder.custom_state().join_predicates =
+                builder.custom_private().join_predicates().clone();
+
+            // store our query into our custom state too
+            let base_query = builder
+                .custom_private()
+                .query()
+                .clone()
+                .expect("should have a SearchQueryInput");
+            builder
+                .custom_state()
+                .set_base_search_query_input(base_query);
+
+            if builder.custom_state().need_scores {
+                let state = builder.custom_state();
+                // Pre-compute enhanced score query if we have join predicates that could affect scoring
+                let mut enhanced_score_query = None;
+                if let Some(ref join_predicate) = state.join_predicates {
+                    // Check the ORIGINAL base query for this relation, not the modified search_query_input
+                    // which may contain simplified join predicates from other relations
+                    let original_base_query = state.base_search_query_input();
+
+                    // Only enhance scoring if the base query doesn't already have search predicates
+                    // If base query has @@@ conditions, it already provides scoring context
+                    if !base_query_has_search_predicates(original_base_query, state.indexrelid) {
+                        // Combine base query with join predicate using Boolean structure
+                        // This provides enhanced search context for scoring while maintaining
+                        // the same filtering behavior as the base query
+                        enhanced_score_query = Some(SearchQueryInput::Boolean {
+                            must: vec![original_base_query.clone()],
+                            should: vec![join_predicate.clone()],
+                            must_not: vec![],
+                        });
+                    }
+                }
+
+                // Store enhanced score query for use during search execution
+                // This will be None for single-table queries, which is correct
+                if let Some(enhanced_score_query) = enhanced_score_query {
+                    builder
+                        .custom_state()
+                        .set_base_search_query_input(enhanced_score_query);
+                }
+            }
 
             let node = builder.target_list().as_ptr().cast();
             builder.custom_state().planning_rti = builder
@@ -706,10 +875,10 @@ impl CustomScan for PdbScan {
 
         if let Some(limit) = state.custom_state().limit {
             explainer.add_unsigned_integer("   Top N Limit", limit as u64, None);
-            if explainer.is_analyze() && state.custom_state().retry_count > 0 {
+            if explainer.is_analyze() {
                 explainer.add_unsigned_integer(
-                    "   Invisible Tuple Retries",
-                    state.custom_state().retry_count as u64,
+                    "   Queries",
+                    state.custom_state().query_count as u64,
                     None,
                 );
             }
@@ -745,26 +914,7 @@ impl CustomScan for PdbScan {
             assert!(!rte.is_null());
             let lockmode = (*rte).rellockmode as pg_sys::LOCKMODE;
 
-            let (heaprel, indexrel) = if lockmode == pg_sys::NoLock as pg_sys::LOCKMODE {
-                (
-                    pg_sys::RelationIdGetRelation(state.custom_state().heaprelid),
-                    pg_sys::RelationIdGetRelation(state.custom_state().indexrelid),
-                )
-            } else {
-                (
-                    pg_sys::relation_open(state.custom_state().heaprelid, lockmode),
-                    pg_sys::relation_open(state.custom_state().indexrelid, lockmode),
-                )
-            };
-
-            state.custom_state_mut().heaprel = Some(heaprel);
-            state.custom_state_mut().indexrel = Some(indexrel);
-            state.custom_state_mut().lockmode = lockmode;
-
-            state.custom_state_mut().heaprel_namespace =
-                PgRelation::from_pg(heaprel).namespace().to_string();
-            state.custom_state_mut().heaprel_relname =
-                PgRelation::from_pg(heaprel).name().to_string();
+            state.custom_state_mut().open_relations(lockmode);
 
             if eflags & (pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32) != 0 {
                 // don't do anything else if we're only explaining the query
@@ -772,9 +922,11 @@ impl CustomScan for PdbScan {
             }
 
             // setup the structures we need to do mvcc checking
-            state.custom_state_mut().visibility_checker = Some(
-                VisibilityChecker::with_rel_and_snap(heaprel, pg_sys::GetActiveSnapshot()),
-            );
+            state.custom_state_mut().visibility_checker =
+                Some(VisibilityChecker::with_rel_and_snap(
+                    state.custom_state().heaprel(),
+                    pg_sys::GetActiveSnapshot(),
+                ));
 
             // and finally, get the custom scan itself properly initialized
             let tupdesc = state.custom_state().heaptupdesc();
@@ -782,7 +934,7 @@ impl CustomScan for PdbScan {
                 estate,
                 addr_of_mut!(state.csstate.ss),
                 tupdesc,
-                pg_sys::table_slot_callbacks(state.custom_state().heaprel()),
+                pg_sys::table_slot_callbacks(state.custom_state().heaprel().as_ptr()),
             );
             pg_sys::ExecInitResultTypeTL(addr_of_mut!(state.csstate.ss.ps));
             pg_sys::ExecAssignProjectionInfo(
@@ -981,16 +1133,8 @@ impl CustomScan for PdbScan {
         ));
         drop(std::mem::take(&mut state.custom_state_mut().search_results));
 
-        if let Some(heaprel) = state.custom_state_mut().heaprel.take() {
-            unsafe {
-                pg_sys::relation_close(heaprel, state.custom_state().lockmode);
-            }
-        }
-        if let Some(indexrel) = state.custom_state_mut().indexrel.take() {
-            unsafe {
-                pg_sys::relation_close(indexrel, state.custom_state().lockmode);
-            }
-        }
+        state.custom_state_mut().heaprel.take();
+        state.custom_state_mut().indexrel.take();
     }
 }
 
@@ -1020,7 +1164,6 @@ fn choose_exec_method(privdata: &PrivateData) -> ExecMethodType {
             heaprelid: privdata.heaprelid().expect("heaprelid must be set"),
             limit,
             sort_direction,
-            need_scores: privdata.need_scores(),
         }
     } else if fast_fields::is_numeric_fast_field_capable(privdata) {
         // Check for numeric-only fast fields first because they're more selective
@@ -1058,14 +1201,8 @@ fn assign_exec_method(builder: &mut CustomScanStateBuilder<PdbScan, PrivateData>
             heaprelid,
             limit,
             sort_direction,
-            need_scores,
         } => builder.custom_state().assign_exec_method(
-            exec_methods::top_n::TopNScanExecState::new(
-                heaprelid,
-                limit,
-                sort_direction,
-                need_scores,
-            ),
+            exec_methods::top_n::TopNScanExecState::new(heaprelid, limit, sort_direction),
             None,
         ),
         ExecMethodType::FastFieldString {
@@ -1136,14 +1273,10 @@ fn compute_exec_which_fast_fields(
     planned_which_fast_fields: HashSet<WhichFastField>,
 ) -> Option<Vec<WhichFastField>> {
     let exec_which_fast_fields = unsafe {
-        let indexrel = PgRelation::open(builder.custom_state().indexrelid);
-        let heaprel = indexrel
-            .heap_relation()
-            .expect("index should belong to a table");
-        let directory = MVCCDirectory::snapshot(indexrel.oid());
-        let index =
-            Index::open(directory).expect("create_custom_scan_state: should be able to open index");
-        let schema = SearchIndexSchema::open(index.schema(), &indexrel);
+        let indexrel = builder.custom_state().indexrel();
+        let schema = indexrel
+            .schema()
+            .expect("create_custom_scan_state: should have a schema");
 
         // Calculate the ordered set of fast fields which have actually been requested in
         // the target list.
@@ -1158,7 +1291,7 @@ fn compute_exec_which_fast_fields(
             &HashSet::default(),
             builder.custom_state().execution_rti,
             &schema,
-            &heaprel,
+            builder.custom_state().heaprel(),
             true,
         )
     };
@@ -1252,8 +1385,10 @@ unsafe fn pullup_orderby_pathkey<P: Into<*mut pg_sys::List> + Default>(
                 let heaprel = PgRelation::with_lock(heaprelid, pg_sys::AccessShareLock as _);
                 let tupdesc = heaprel.tuple_desc();
                 if let Some(att) = tupdesc.get(attno as usize - 1) {
-                    if schema.is_field_lower_sortable(&att.name().into()) {
-                        return Some(OrderByStyle::Field(first_pathkey, att.name().into()));
+                    if let Some(search_field) = schema.search_field(att.name()) {
+                        if search_field.is_lower_sortable() {
+                            return Some(OrderByStyle::Field(first_pathkey, att.name().into()));
+                        }
                     }
                 }
             } else if let Some(relabel) = nodecast!(RelabelType, T_RelabelType, expr) {
@@ -1262,8 +1397,10 @@ unsafe fn pullup_orderby_pathkey<P: Into<*mut pg_sys::List> + Default>(
                     let heaprel = PgRelation::with_lock(heaprelid, pg_sys::AccessShareLock as _);
                     let tupdesc = heaprel.tuple_desc();
                     if let Some(att) = tupdesc.get(attno as usize - 1) {
-                        if schema.is_field_raw_sortable(&att.name().into()) {
-                            return Some(OrderByStyle::Field(first_pathkey, att.name().into()));
+                        if let Some(search_field) = schema.search_field(att.name()) {
+                            if search_field.is_raw_sortable() {
+                                return Some(OrderByStyle::Field(first_pathkey, att.name().into()));
+                            }
                         }
                     }
                 }
@@ -1275,8 +1412,10 @@ unsafe fn pullup_orderby_pathkey<P: Into<*mut pg_sys::List> + Default>(
                 let heaprel = PgRelation::with_lock(heaprelid, pg_sys::AccessShareLock as _);
                 let tupdesc = heaprel.tuple_desc();
                 if let Some(att) = tupdesc.get(attno as usize - 1) {
-                    if schema.is_field_raw_sortable(&att.name().into()) {
-                        return Some(OrderByStyle::Field(first_pathkey, att.name().into()));
+                    if let Some(search_field) = schema.search_field(att.name()) {
+                        if search_field.is_raw_sortable() {
+                            return Some(OrderByStyle::Field(first_pathkey, att.name().into()));
+                        }
                     }
                 }
             }
@@ -1323,12 +1462,12 @@ pub fn text_lower_funcoid() -> pg_sys::Oid {
 
 #[inline(always)]
 pub fn is_block_all_visible(
-    heaprel: pg_sys::Relation,
+    heaprel: &PgSearchRelation,
     vmbuff: &mut pg_sys::Buffer,
     heap_blockno: pg_sys::BlockNumber,
 ) -> bool {
     unsafe {
-        let status = pg_sys::visibilitymap_get_status(heaprel, heap_blockno, vmbuff);
+        let status = pg_sys::visibilitymap_get_status(heaprel.as_ptr(), heap_blockno, vmbuff);
         status != 0
     }
 }
@@ -1411,6 +1550,7 @@ unsafe fn is_partitioned_table_setup(
 /// This function is critical for issue #2505/#2556 where we need to detect all columns used in JOIN
 /// conditions to ensure we select the right execution method. Previously, only looking at the
 /// target list would miss columns referenced in JOIN conditions, leading to execution-time errors.
+///
 unsafe fn collect_maybe_fast_field_referenced_columns(
     rte_index: pg_sys::Index,
     rel: *mut pg_sys::RelOptInfo,
@@ -1431,4 +1571,106 @@ unsafe fn collect_maybe_fast_field_referenced_columns(
     }
 
     referenced_columns
+}
+
+/// Check if the base query has search predicates for the current table's index
+fn base_query_has_search_predicates(
+    query: &SearchQueryInput,
+    current_index_oid: pg_sys::Oid,
+) -> bool {
+    match query {
+        SearchQueryInput::All => false,
+        SearchQueryInput::Uninitialized => false,
+        SearchQueryInput::Empty => false,
+
+        SearchQueryInput::WithIndex { oid, query } => {
+            // Only consider search predicates for the current table's index
+            if *oid == current_index_oid {
+                // This is a search predicate for our index
+                // Check the inner query directly for range vs search predicates
+                base_query_has_search_predicates(query, current_index_oid)
+            } else {
+                // This is a search predicate for a different index, ignore it
+                false
+            }
+        }
+
+        // Boolean queries need recursive checking
+        SearchQueryInput::Boolean {
+            must,
+            should,
+            must_not,
+        } => {
+            must.iter()
+                .any(|q| base_query_has_search_predicates(q, current_index_oid))
+                || should
+                    .iter()
+                    .any(|q| base_query_has_search_predicates(q, current_index_oid))
+                || must_not
+                    .iter()
+                    .any(|q| base_query_has_search_predicates(q, current_index_oid))
+        }
+
+        // Wrapper queries need recursive checking
+        SearchQueryInput::Boost { query, .. } => {
+            base_query_has_search_predicates(query, current_index_oid)
+        }
+        SearchQueryInput::ConstScore { query, .. } => {
+            base_query_has_search_predicates(query, current_index_oid)
+        }
+        SearchQueryInput::ScoreFilter {
+            query: Some(query), ..
+        } => base_query_has_search_predicates(query, current_index_oid),
+        SearchQueryInput::ScoreFilter { query: None, .. } => false,
+        SearchQueryInput::DisjunctionMax { disjuncts, .. } => disjuncts
+            .iter()
+            .any(|q| base_query_has_search_predicates(q, current_index_oid)),
+
+        // These are NOT search predicates (they're range/exists/other predicates)
+        SearchQueryInput::Range { .. }
+        | SearchQueryInput::RangeContains { .. }
+        | SearchQueryInput::RangeIntersects { .. }
+        | SearchQueryInput::RangeTerm { .. }
+        | SearchQueryInput::RangeWithin { .. }
+        | SearchQueryInput::Exists { .. }
+        | SearchQueryInput::FastFieldRangeWeight { .. }
+        | SearchQueryInput::MoreLikeThis { .. } => false,
+
+        // These are search predicates that use the @@@ operator
+        SearchQueryInput::ParseWithField { query_string, .. } => {
+            // For ParseWithField, check if it's a text search or a range query
+            !is_range_query_string(query_string)
+        }
+        SearchQueryInput::Parse { .. }
+        | SearchQueryInput::TermSet { .. }
+        | SearchQueryInput::Term { field: Some(_), .. }
+        | SearchQueryInput::Phrase { .. }
+        | SearchQueryInput::PhrasePrefix { .. }
+        | SearchQueryInput::FuzzyTerm { .. }
+        | SearchQueryInput::Match { .. }
+        | SearchQueryInput::Regex { .. }
+        | SearchQueryInput::RegexPhrase { .. } => true,
+
+        // Term with no field is not a search predicate
+        SearchQueryInput::Term { field: None, .. } => false,
+
+        // Postgres expressions are unknown, assume they could be search predicates
+        SearchQueryInput::PostgresExpression { .. } => true,
+
+        // HeapFilter contains search predicates
+        SearchQueryInput::HeapFilter { indexed_query, .. } => {
+            base_query_has_search_predicates(indexed_query, current_index_oid)
+        }
+    }
+}
+
+/// Check if a query string represents a range query (contains operators like >, <, etc.)
+fn is_range_query_string(query_string: &str) -> bool {
+    // Range queries typically start with operators
+    query_string.trim_start().starts_with('>')
+        || query_string.trim_start().starts_with('<')
+        || query_string.trim_start().starts_with(">=")
+        || query_string.trim_start().starts_with("<=")
+        || query_string.contains("..")  // Range syntax like "1..10"
+        || query_string.contains(" TO ") // Range syntax like "1 TO 10"
 }

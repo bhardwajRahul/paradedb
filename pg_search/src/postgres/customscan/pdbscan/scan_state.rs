@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::api::index::FieldName;
+use crate::api::FieldName;
 use crate::api::HashMap;
 use crate::api::Varno;
 use crate::index::reader::index::{SearchIndexReader, SearchResults};
@@ -24,13 +24,13 @@ use crate::postgres::customscan::pdbscan::exec_methods::ExecMethod;
 use crate::postgres::customscan::pdbscan::projections::snippet::SnippetType;
 use crate::postgres::customscan::pdbscan::qual_inspect::Qual;
 use crate::postgres::customscan::CustomScanState;
-use crate::postgres::options::SearchIndexCreateOptions;
+use crate::postgres::rel::PgSearchRelation;
 use crate::postgres::utils::u64_to_item_pointer;
 use crate::postgres::visibility_checker::VisibilityChecker;
 use crate::postgres::ParallelScanState;
 use crate::query::{AsHumanReadable, SearchQueryInput};
 use pgrx::heap_tuple::PgHeapTuple;
-use pgrx::{name_data_to_str, pg_sys, PgRelation, PgTupleDesc};
+use pgrx::{name_data_to_str, pg_sys, PgTupleDesc};
 use std::cell::UnsafeCell;
 use tantivy::snippet::SnippetGenerator;
 use tantivy::SegmentReader;
@@ -58,19 +58,16 @@ pub struct PdbScanState {
     pub sort_field: Option<FieldName>,
     pub sort_direction: Option<SortDirection>,
 
-    pub retry_count: usize,
+    pub query_count: usize,
     pub heap_tuple_check_count: usize,
     pub virtual_tuple_count: usize,
     pub invisible_tuple_count: usize,
 
     pub heaprelid: pg_sys::Oid,
-    pub heaprel: Option<pg_sys::Relation>,
-    pub indexrel: Option<pg_sys::Relation>,
+    pub heaprel: Option<PgSearchRelation>,
+    pub indexrel: Option<PgSearchRelation>,
     pub indexrelid: pg_sys::Oid,
     pub lockmode: pg_sys::LOCKMODE,
-
-    pub heaprel_namespace: String,
-    pub heaprel_relname: String,
 
     pub visibility_checker: Option<VisibilityChecker>,
     pub segment_count: usize,
@@ -91,6 +88,9 @@ pub struct PdbScanState {
     pub var_attname_lookup: HashMap<(Varno, pg_sys::AttrNumber), FieldName>,
     pub placeholder_targetlist: Option<*mut pg_sys::List>,
 
+    // Store join-level search predicates for enhanced scoring/snippet generation
+    pub join_predicates: Option<SearchQueryInput>,
+
     pub exec_method_type: ExecMethodType,
     exec_method: UnsafeCell<Box<dyn ExecMethod>>,
     exec_method_name: String,
@@ -106,6 +106,25 @@ impl CustomScanState for PdbScanState {
 }
 
 impl PdbScanState {
+    pub fn open_relations(&mut self, lockmode: pg_sys::LOCKMODE) {
+        self.lockmode = lockmode;
+        if self.heaprel.is_none() {
+            self.heaprel = if lockmode == pg_sys::NoLock as pg_sys::LOCKMODE {
+                Some(PgSearchRelation::open(self.heaprelid))
+            } else {
+                Some(PgSearchRelation::with_lock(self.heaprelid, lockmode))
+            }
+        };
+
+        if self.indexrel.is_none() {
+            self.indexrel = if lockmode == pg_sys::NoLock as pg_sys::LOCKMODE {
+                Some(PgSearchRelation::open(self.indexrelid))
+            } else {
+                Some(PgSearchRelation::with_lock(self.indexrelid, lockmode))
+            }
+        };
+    }
+
     pub fn set_base_search_query_input(&mut self, input: SearchQueryInput) {
         self.base_search_query_input = input;
     }
@@ -128,6 +147,11 @@ impl PdbScanState {
             panic!("search_query_input should be initialized");
         }
         &self.search_query_input
+    }
+
+    /// Get the original base search query input before any modifications
+    pub fn base_search_query_input(&self) -> &SearchQueryInput {
+        &self.base_search_query_input
     }
 
     #[inline(always)]
@@ -198,50 +222,38 @@ impl PdbScanState {
     }
 
     #[inline(always)]
-    pub fn determine_key_field(&self) -> FieldName {
-        unsafe {
-            let indexrel = PgRelation::with_lock(self.indexrelid, pg_sys::AccessShareLock as _);
-            let ops = indexrel.rd_options as *mut SearchIndexCreateOptions;
-            (*ops)
-                .get_key_field()
-                .expect("`USING bm25` index should have a valued `key_field` option")
-        }
-    }
-
-    #[inline(always)]
     pub fn need_snippets(&self) -> bool {
         !self.snippet_generators.is_empty()
     }
 
     #[track_caller]
     #[inline(always)]
-    pub fn heaprel(&self) -> pg_sys::Relation {
-        self.heaprel.unwrap()
+    pub fn heaprel(&self) -> &PgSearchRelation {
+        self.heaprel
+            .as_ref()
+            .expect("PdbScanState: heaprel should be initialized")
     }
 
     #[inline(always)]
-    pub fn indexrel(&self) -> pg_sys::Relation {
-        self.indexrel.unwrap()
-    }
-
-    #[inline(always)]
-    pub fn heaprel_namespace(&self) -> &str {
-        &self.heaprel_namespace
+    pub fn indexrel(&self) -> &PgSearchRelation {
+        self.indexrel
+            .as_ref()
+            .expect("PdbScanState: indexrel should be initialized")
     }
 
     #[inline(always)]
     pub fn heaprelname(&self) -> &str {
-        &self.heaprel_relname
+        unsafe { name_data_to_str(&(*self.heaprel().rd_rel).relname) }
     }
 
     #[inline(always)]
     pub fn indexrelname(&self) -> &str {
-        unsafe { name_data_to_str(&(*(*self.indexrel()).rd_rel).relname) }
+        unsafe { name_data_to_str(&(*self.indexrel().rd_rel).relname) }
     }
 
     #[inline(always)]
     pub fn heaptupdesc(&self) -> pg_sys::TupleDesc {
-        unsafe { (*self.heaprel()).rd_att }
+        self.heaprel().rd_att
     }
 
     #[inline(always)]
@@ -279,8 +291,7 @@ impl PdbScanState {
             None
         } else {
             Some(
-                snippet
-                    .highlighted()
+                highlighted
                     .iter()
                     .map(|span| vec![span.start as i32, span.end as i32])
                     .collect(),
@@ -306,7 +317,7 @@ impl PdbScanState {
             }
         }
         self.search_results = SearchResults::None;
-        self.retry_count = 0;
+        self.query_count = 0;
         self.heap_tuple_check_count = 0;
         self.virtual_tuple_count = 0;
         self.invisible_tuple_count = 0;
@@ -315,11 +326,9 @@ impl PdbScanState {
 
     /// Given a ctid and field name, get the corresponding value from the heap
     ///
-    /// This function supports text and text[] fields
+    /// This function supports text, text[], and json/jsonb fields
     unsafe fn doc_from_heap(&self, ctid: u64, field: &FieldName) -> Option<String> {
-        let heaprel = self
-            .heaprel
-            .expect("make_snippet: heaprel should be initialized");
+        let heaprel = self.heaprel();
         let mut ipd = pg_sys::ItemPointerData::default();
         u64_to_item_pointer(ctid, &mut ipd);
 
@@ -331,7 +340,12 @@ impl PdbScanState {
 
         #[cfg(feature = "pg14")]
         {
-            if !pg_sys::heap_fetch(heaprel, pg_sys::GetActiveSnapshot(), &mut htup, &mut buffer) {
+            if !pg_sys::heap_fetch(
+                heaprel.as_ptr(),
+                pg_sys::GetActiveSnapshot(),
+                &mut htup,
+                &mut buffer,
+            ) {
                 return None;
             }
         }
@@ -339,7 +353,7 @@ impl PdbScanState {
         #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
         {
             if !pg_sys::heap_fetch(
-                heaprel,
+                heaprel.as_ptr(),
                 pg_sys::GetActiveSnapshot(),
                 &mut htup,
                 &mut buffer,
@@ -351,7 +365,7 @@ impl PdbScanState {
 
         pg_sys::ReleaseBuffer(buffer);
 
-        let tuple_desc = PgTupleDesc::from_pg_unchecked((*heaprel).rd_att);
+        let tuple_desc = PgTupleDesc::from_pg_unchecked(heaprel.rd_att);
         let heap_tuple = PgHeapTuple::from_heap_tuple(tuple_desc.clone(), &mut htup);
         let (index, attribute) = heap_tuple.get_attribute_by_name(&field.root()).unwrap();
 
@@ -371,9 +385,53 @@ impl PdbScanState {
                 .join(" "),
             )
         } else {
-            heap_tuple
-                .get_by_name(&field.root())
-                .unwrap_or_else(|_| panic!("{} should exist in the heap tuple", field))
+            match (field.root(), field.path()) {
+                (root, Some(path)) => {
+                    let pointer = format!("/{}", path.replace('.', "/"));
+                    let field = match attribute.type_oid().value() {
+                        pg_sys::JSONOID => {
+                            let json_value = heap_tuple
+                                .get_by_name::<pgrx::datum::Json>(&root)
+                                .unwrap_or_else(|_| {
+                                    panic!(
+                                        "doc_from_heap: should be able to read json field {root}"
+                                    )
+                                })?
+                                .0;
+                            json_value.pointer(&pointer).cloned()?
+                        }
+                        pg_sys::JSONBOID => {
+                            let json_value = heap_tuple
+                                .get_by_name::<pgrx::datum::JsonB>(&root)
+                                .unwrap_or_else(|_| {
+                                    panic!(
+                                        "doc_from_heap: should be able to read jsonb field {root}"
+                                    )
+                                })?
+                                .0;
+                            json_value.pointer(&pointer).cloned()?
+                        }
+                        unsupported => {
+                            return None;
+                        }
+                    };
+
+                    match field {
+                        serde_json::Value::String(val) => Some(val),
+                        serde_json::Value::Array(array) => Some(array.iter().filter_map(|v| match v {
+                            serde_json::Value::String(s) => Some(s.to_owned()),
+                            _ => None
+                        }).collect::<Vec<_>>().join(" ")),
+                        val => unimplemented!(
+                            "only text fields for json/jsonb are supported for snippets, found {:?}",
+                            val
+                        ),
+                    }
+                }
+                (root, None) => heap_tuple
+                    .get_by_name(&root)
+                    .unwrap_or_else(|_| panic!("doc_from_heap: should be able to read {root}")),
+            }
         }
     }
 }

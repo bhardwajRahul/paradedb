@@ -1,4 +1,6 @@
-use crate::postgres::storage::block::{bm25_max_free_space, FileEntry, SegmentFileDetails};
+use crate::index::directory::mvcc::BUFWRITER_CAPACITY;
+use crate::postgres::rel::PgSearchRelation;
+use crate::postgres::storage::block::{FileEntry, SegmentFileDetails};
 use crate::postgres::storage::{LinkedBytesList, LinkedBytesListWriter};
 use pgrx::*;
 use std::io::{Result, Write};
@@ -14,7 +16,7 @@ pub struct SegmentComponentWriter {
 }
 
 impl SegmentComponentWriter {
-    pub unsafe fn new(relation_oid: pg_sys::Oid, path: &Path) -> Self {
+    pub unsafe fn new(indexrel: &PgSearchRelation, path: &Path) -> Self {
         if path.component_type() == Some(SegmentComponent::Store) {
             Self {
                 inner: None,
@@ -22,12 +24,13 @@ impl SegmentComponentWriter {
             }
         } else {
             Self {
-                inner: Some(InnerSegmentComponentWriter::new(relation_oid)),
+                inner: Some(InnerSegmentComponentWriter::new(indexrel)),
                 path: path.to_path_buf(),
             }
         }
     }
 
+    #[allow(unused)]
     pub fn path(&self) -> PathBuf {
         self.path.clone()
     }
@@ -83,19 +86,19 @@ impl TerminatingWrite for SegmentComponentWriter {
 struct InnerSegmentComponentWriter {
     header_blockno: pg_sys::BlockNumber,
     total_bytes: Arc<AtomicUsize>,
-    buffer: ExactBuffer<{ bm25_max_free_space() }, LinkedBytesListWriter>,
+    buffer: ExactBuffer<{ BUFWRITER_CAPACITY }, LinkedBytesListWriter>,
 }
 
 impl InnerSegmentComponentWriter {
-    pub unsafe fn new(relation_oid: pg_sys::Oid) -> Self {
-        let segment_component = LinkedBytesList::create(relation_oid);
+    pub unsafe fn new(indexrel: &PgSearchRelation) -> Self {
+        let segment_component = LinkedBytesList::create(indexrel);
 
         Self {
             header_blockno: segment_component.header_blockno,
             total_bytes: Default::default(),
             buffer: ExactBuffer {
                 writer: segment_component.writer(),
-                buffer: [0; bm25_max_free_space()],
+                buffer: [0; BUFWRITER_CAPACITY],
                 len: 0,
             },
         }
@@ -142,7 +145,10 @@ struct ExactBuffer<const CAPACITY: usize, W: Write> {
 
 impl<const CAPACITY: usize, W: Write> Drop for ExactBuffer<CAPACITY, W> {
     fn drop(&mut self) {
-        self.flush().ok();
+        // self.flush() creates buffers -- don't do this if we are not in a transaction i.e. have aborted
+        if unsafe { pg_sys::IsTransactionState() } {
+            self.flush().ok();
+        }
     }
 }
 

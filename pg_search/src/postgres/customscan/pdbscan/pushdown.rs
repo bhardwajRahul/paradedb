@@ -15,9 +15,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::api::index::{fieldname_typoid, FieldName};
+use super::opexpr::OpExpr;
 use crate::api::operator::searchqueryinput_typoid;
-use crate::api::HashMap;
+use crate::api::{fieldname_typoid, FieldName, HashMap};
 use crate::nodecast;
 use crate::postgres::customscan::operator_oid;
 use crate::postgres::customscan::pdbscan::qual_inspect::Qual;
@@ -41,8 +41,11 @@ impl PushdownField {
         schema: &SearchIndexSchema,
     ) -> Option<Self> {
         let (heaprelid, varattno, _) = find_var_relation(var, root);
+        if heaprelid == pg_sys::Oid::INVALID {
+            return None;
+        }
         let field = fieldname_from_var(heaprelid, var, varattno)?;
-        schema.get_search_field(&field).map(|_| Self(field))
+        schema.search_field(&field).map(|_| Self(field))
     }
 
     /// Create a new [`PushdownField`] from an attribute name.
@@ -56,24 +59,24 @@ impl PushdownField {
         self.0.clone()
     }
 
-    pub fn search_field<'a>(&self, schema: &'a SearchIndexSchema) -> Option<&'a SearchField> {
-        schema.get_search_field(&self.0)
+    pub fn search_field(&self, schema: &SearchIndexSchema) -> Option<SearchField> {
+        schema.search_field(&self.0)
     }
 }
 
 macro_rules! pushdown {
-    ($attname:expr, $opexpr:expr, $operator:expr, $rhs:ident) => {
+    ($attname:expr, $opexpr:expr, $operator:expr, $rhs:ident) => {{
         let funcexpr = make_opexpr($attname, $opexpr, $operator, $rhs);
 
         if !is_complex(funcexpr.cast()) {
-            return Some(Qual::PushdownExpr { funcexpr });
+            Qual::PushdownExpr { funcexpr }
         } else {
-            return Some(Qual::Expr {
+            Qual::Expr {
                 node: funcexpr.cast(),
                 expr_state: std::ptr::null_mut(),
-            });
+            }
         }
-    };
+    }};
 }
 
 type PostgresOperatorOid = pg_sys::Oid;
@@ -127,12 +130,13 @@ unsafe fn initialize_equality_operator_lookup() -> HashMap<PostgresOperatorOid, 
 ///
 /// Returns `Some(Qual)` if we were able to convert it, `None` if not.
 #[rustfmt::skip]
-pub unsafe fn try_pushdown(
+pub unsafe fn try_pushdown_inner(
     root: *mut pg_sys::PlannerInfo,
-    opexpr: *mut pg_sys::OpExpr,
+    rti: pg_sys::Index,
+    opexpr: OpExpr,
     schema: &SearchIndexSchema
 ) -> Option<Qual> {
-    let args = PgList::<pg_sys::Node>::from_pg((*opexpr).args);
+    let args = opexpr.args();
     let var = {
         // inspect the left-hand-side of the operator expression...
         let mut lhs = args.get_ptr(0)?;
@@ -153,8 +157,19 @@ pub unsafe fn try_pushdown(
     }
 
     static EQUALITY_OPERATOR_LOOKUP: OnceLock<HashMap<pg_sys::Oid, &str>> = OnceLock::new();
-    match EQUALITY_OPERATOR_LOOKUP.get_or_init(|| initialize_equality_operator_lookup()).get(&(*opexpr).opno) {
-        Some(pgsearch_operator) => { pushdown!(&pushdown.attname(), opexpr, pgsearch_operator, rhs); },
+    match EQUALITY_OPERATOR_LOOKUP.get_or_init(|| initialize_equality_operator_lookup()).get(&opexpr.opno()) {
+        Some(pgsearch_operator) => {
+            // the `opexpr` is one we can pushdown
+            if (*var).varno as pg_sys::Index == rti {
+                let pushed_down_qual = pushdown!(&pushdown.attname(), opexpr, pgsearch_operator, rhs);
+                // and it's in this RTI, so we can use it directly
+                Some(pushed_down_qual)
+            } else {
+                // it's not in this RTI, which means it's in some other table due to a join, so
+                // we need to indicate an arbitrary external var
+                Some(Qual::ExternalVar)
+            }
+        },
         None => {
             // TODO:  support other types of OpExprs
             None
@@ -171,23 +186,35 @@ unsafe fn term_with_operator_procid() -> pg_sys::Oid {
             .expect("the `paradedb.term_with_operator(paradedb.fieldname, text, anyelement)` function should exist")
 }
 
+unsafe fn terms_with_operator_procid() -> pg_sys::Oid {
+    direct_function_call::<pg_sys::Oid>(
+            pg_sys::regprocedurein,
+            // NB:  the SQL signature here needs to match our Rust implementation
+            &[c"paradedb.terms_with_operator(paradedb.fieldname, text, anyelement, bool)".into_datum()],
+        )
+            .expect("the `paradedb.terms_with_operator(paradedb.fieldname, text, anyelement, bool)` function should exist")
+}
+
 unsafe fn make_opexpr(
     field: &FieldName,
-    orig_opexor: *mut pg_sys::OpExpr,
+    orig_opexor: OpExpr,
     operator: &str,
     value: *mut pg_sys::Node,
 ) -> *mut pg_sys::FuncExpr {
     let paradedb_funcexpr: *mut pg_sys::FuncExpr =
         pg_sys::palloc0(size_of::<pg_sys::FuncExpr>()).cast();
     (*paradedb_funcexpr).xpr.type_ = pg_sys::NodeTag::T_FuncExpr;
-    (*paradedb_funcexpr).funcid = term_with_operator_procid();
+    (*paradedb_funcexpr).funcid = match orig_opexor {
+        OpExpr::Array(_) => terms_with_operator_procid(),
+        OpExpr::Single(_) => term_with_operator_procid(),
+    };
     (*paradedb_funcexpr).funcresulttype = searchqueryinput_typoid();
     (*paradedb_funcexpr).funcretset = false;
     (*paradedb_funcexpr).funcvariadic = false;
     (*paradedb_funcexpr).funcformat = pg_sys::CoercionForm::COERCE_EXPLICIT_CALL;
     (*paradedb_funcexpr).funccollid = pg_sys::InvalidOid;
-    (*paradedb_funcexpr).inputcollid = (*orig_opexor).inputcollid;
-    (*paradedb_funcexpr).location = (*orig_opexor).location;
+    (*paradedb_funcexpr).inputcollid = orig_opexor.inputcollid();
+    (*paradedb_funcexpr).location = orig_opexor.location();
     (*paradedb_funcexpr).args = {
         let fieldname = pg_sys::makeConst(
             fieldname_typoid(),
@@ -212,6 +239,12 @@ unsafe fn make_opexpr(
         args.push(fieldname.cast());
         args.push(operator.cast());
         args.push(value.cast());
+
+        if matches!(orig_opexor, OpExpr::Array(_)) {
+            let conjunction_mode = !orig_opexor.use_or().unwrap(); // invert meaning for `conjunction` (which would be AND)
+            let use_or = pg_sys::makeBoolConst(conjunction_mode, false);
+            args.push(use_or.cast());
+        }
 
         args.into_pg()
     };

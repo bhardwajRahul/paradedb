@@ -20,6 +20,7 @@ use crate::postgres::build::is_bm25_index;
 use crate::postgres::spinlock::Spinlock;
 use crate::query::SearchQueryInput;
 use pgrx::*;
+use rel::PgSearchRelation;
 use std::io::Write;
 use tantivy::index::SegmentId;
 use tantivy::SegmentReader;
@@ -27,19 +28,23 @@ use tantivy::SegmentReader;
 mod build;
 mod cost;
 mod delete;
+pub mod expression;
 pub mod insert;
 pub mod options;
+mod ps_status;
 mod range;
 mod scan;
 mod vacuum;
 mod validate;
 
+mod build_parallel;
 pub mod customscan;
 pub mod datetime;
 #[cfg(not(feature = "pg17"))]
 pub mod fake_aminsertcleanup;
 pub mod index;
 mod parallel;
+pub mod rel;
 pub mod spinlock;
 pub mod storage;
 pub mod types;
@@ -91,6 +96,7 @@ fn bm25_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRouti
     #[cfg(feature = "pg17")]
     {
         amroutine.aminsertcleanup = Some(insert::aminsertcleanup);
+        amroutine.amcanbuildparallel = true;
     }
     amroutine.ambulkdelete = Some(delete::ambulkdelete);
     amroutine.amvacuumcleanup = Some(vacuum::amvacuumcleanup);
@@ -111,13 +117,13 @@ fn bm25_handler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRouti
     amroutine.into_pg_boxed()
 }
 
-pub fn rel_get_bm25_index(relid: pg_sys::Oid) -> Option<(PgRelation, PgRelation)> {
-    unsafe {
-        let rel = PgRelation::with_lock(relid, pg_sys::AccessShareLock as _);
-        rel.indices(pg_sys::AccessShareLock as _)
-            .find(is_bm25_index)
-            .map(|index| (rel, index))
-    }
+pub fn rel_get_bm25_index(
+    relid: pg_sys::Oid,
+) -> Option<(rel::PgSearchRelation, rel::PgSearchRelation)> {
+    let rel = PgSearchRelation::with_lock(relid, pg_sys::AccessShareLock as _);
+    rel.indices(pg_sys::AccessShareLock as _)
+        .find(is_bm25_index)
+        .map(|index| (rel, index))
 }
 
 // 16 bytes for segment id + 4 bytes for u32 num_deleted_docs
@@ -151,6 +157,15 @@ impl ParallelScanPayload {
             let ptr = &mut self.data_mut()[segments_start..segments_end].as_mut_ptr();
             let segments_slice: &mut [[u8; SEGMENT_INFO_SIZE]] =
                 std::slice::from_raw_parts_mut(ptr.cast(), segments.len());
+
+            // resort the segments, smallest to largest by document count
+            //
+            // when segments are claimed by workers they're claimed from back-to-front
+            // and our goal is to have the largest segments claimed first so that
+            // the processing done on them takes longer, allowing more workers to
+            // checkout their own segments
+            let mut segments = segments.iter().collect::<Vec<_>>();
+            segments.sort_unstable_by_key(|reader| reader.max_doc() - reader.num_deleted_docs());
 
             for (segment, target) in segments.iter().zip(segments_slice.iter_mut()) {
                 let mut writer = &mut target[..];

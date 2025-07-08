@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::iter::Peekable;
 
-use crate::api::index::FieldName;
+use crate::api::FieldName;
 use crate::index::reader::index::{SearchIndexReader, SearchResults};
 use crate::postgres::customscan::builders::custom_path::SortDirection;
 use crate::postgres::customscan::pdbscan::exec_methods::{ExecMethod, ExecState};
@@ -38,7 +38,6 @@ pub struct TopNScanExecState {
     heaprelid: pg_sys::Oid,
     limit: usize,
     sort_direction: SortDirection,
-    need_scores: bool,
 
     // set during init
     search_query_input: Option<SearchQueryInput>,
@@ -52,23 +51,16 @@ pub struct TopNScanExecState {
     found: usize,
     offset: usize,
     chunk_size: usize,
-    retry_count: usize,
     // If parallel, the segments which have been claimed by this worker.
     claimed_segments: RefCell<Option<Vec<SegmentId>>>,
 }
 
 impl TopNScanExecState {
-    pub fn new(
-        heaprelid: pg_sys::Oid,
-        limit: usize,
-        sort_direction: SortDirection,
-        need_scores: bool,
-    ) -> Self {
+    pub fn new(heaprelid: pg_sys::Oid, limit: usize, sort_direction: SortDirection) -> Self {
         Self {
             heaprelid,
             limit,
             sort_direction,
-            need_scores,
             search_query_input: None,
             search_reader: None,
             sort_field: None,
@@ -78,7 +70,6 @@ impl TopNScanExecState {
             found: 0,
             offset: 0,
             chunk_size: 0,
-            retry_count: 0,
             claimed_segments: RefCell::default(),
         }
     }
@@ -151,12 +142,19 @@ impl ExecMethod for TopNScanExecState {
     /// Query more results.
     ///
     /// Called either because:
-    /// * We've never run a query before.
+    /// * We've never run a query before (did_query=False).
     /// * Some of the results that we returned were not visible, and so the `chunk_size`, or
     ///   `offset` values have changed.
     ///
     fn query(&mut self, state: &mut PdbScanState) -> bool {
         self.did_query = true;
+
+        if self.found >= self.limit {
+            return false;
+        }
+
+        // We track the total number of queries executed by Top-N (for any of the above reasons).
+        state.query_count += 1;
 
         // Calculate the limit for this query, and what the offset will be for the next query.
         let local_limit = self.limit.max(self.chunk_size);
@@ -168,12 +166,10 @@ impl ExecMethod for TopNScanExecState {
             .unwrap()
             .search_top_n_in_segments(
                 self.segments_to_query(state.search_reader.as_ref().unwrap(), state.parallel_state),
-                self.search_query_input.as_ref().unwrap(),
                 self.sort_field.clone(),
                 self.sort_direction.into(),
                 local_limit,
                 self.offset,
-                self.need_scores,
             )
             .peekable();
 
@@ -213,9 +209,6 @@ impl ExecMethod for TopNScanExecState {
                         // Fall through to query more results.
                     }
                 }
-
-                // we underflowed our tuples, so go get some more, if there are any
-                self.retry_count += 1;
 
                 // calculate a scaling factor to use against the limit
                 let factor = if self.chunk_size == 0 {
@@ -263,7 +256,6 @@ impl ExecMethod for TopNScanExecState {
         self.chunk_size = 0;
         self.offset = 0;
         self.found = 0;
-        self.retry_count = 0;
         self.claimed_segments.take();
     }
 }

@@ -17,7 +17,7 @@
 
 //! Implementation of a mixed field execution state for fast field retrieval.
 //!
-//! This module provides an optimized execution method that can efficiently handle
+//! This module provides an optimized execution method that can efficientl y handle
 //! both multiple string fast fields and numeric fast fields simultaneously,
 //! overcoming the limitation where previously ParadeDB could only support
 //! either multiple numeric fast fields OR a single string fast field.
@@ -43,8 +43,8 @@ use pgrx::pg_sys;
 use pgrx::PgOid;
 use tantivy::collector::Collector;
 use tantivy::index::SegmentId;
-use tantivy::query::Query;
 use tantivy::schema::document::OwnedValue;
+use tantivy::schema::Schema;
 use tantivy::termdict::TermOrdinal;
 use tantivy::{DocAddress, Executor, SegmentOrdinal};
 use tinyvec::TinyVec;
@@ -190,12 +190,17 @@ impl ExecMethod for MixedFastFieldExecState {
             match self.mixed_results.next() {
                 None => ExecState::Eof,
                 Some((scored, doc_address, field_values)) => {
+                    let heaprel = self
+                        .inner
+                        .heaprel
+                        .as_ref()
+                        .expect("MixedFastFieldsExecState: heaprel should be initialized");
                     let slot = self.inner.slot;
                     let natts = (*(*slot).tts_tupleDescriptor).natts as usize;
 
                     // Set ctid and table OID
                     crate::postgres::utils::u64_to_item_pointer(scored.ctid, &mut (*slot).tts_tid);
-                    (*slot).tts_tableOid = (*self.inner.heaprel).rd_id;
+                    (*slot).tts_tableOid = heaprel.oid();
 
                     // Check visibility of the current block
                     let blockno = item_pointer_get_block_number(&(*slot).tts_tid);
@@ -205,11 +210,8 @@ impl ExecMethod for MixedFastFieldExecState {
                     } else {
                         // New block, check visibility
                         self.inner.blockvis.0 = blockno;
-                        self.inner.blockvis.1 = is_block_all_visible(
-                            self.inner.heaprel,
-                            &mut self.inner.vmbuff,
-                            blockno,
-                        );
+                        self.inner.blockvis.1 =
+                            is_block_all_visible(heaprel, &mut self.inner.vmbuff, blockno);
                         self.inner.blockvis.1
                     };
 
@@ -535,12 +537,12 @@ impl MixedAggSearcher<'_> {
         };
 
         // Execute search with the appropriate scoring mode
-        let query = self.0.query(query);
+        let schema = Schema::from(self.0.schema().clone());
         let results = self
             .0
             .searcher()
             .search_with_executor(
-                &query,
+                self.0.query(),
                 &collector,
                 &Executor::SingleThread,
                 if need_scores {
@@ -550,7 +552,7 @@ impl MixedAggSearcher<'_> {
                     }
                 } else {
                     tantivy::query::EnableScoring::Disabled {
-                        schema: &self.0.schema().schema,
+                        schema: &schema,
                         searcher_opt: Some(self.0.searcher()),
                     }
                 },
@@ -600,21 +602,8 @@ impl MixedAggSearcher<'_> {
         };
 
         // Create a query weight for this segment
-        let weight = self
-            .0
-            .query(query)
-            .weight(if need_scores {
-                tantivy::query::EnableScoring::Enabled {
-                    searcher: self.0.searcher(),
-                    statistics_provider: self.0.searcher(),
-                }
-            } else {
-                tantivy::query::EnableScoring::Disabled {
-                    schema: &self.0.schema().schema,
-                    searcher_opt: Some(self.0.searcher()),
-                }
-            })
-            .expect("weight should be constructable");
+        let schema = Schema::from(self.0.schema().clone());
+        let weight = self.0.weight();
 
         // Execute search on this specific segment
         let result = collector

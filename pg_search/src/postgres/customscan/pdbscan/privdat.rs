@@ -15,7 +15,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use crate::api::index::FieldName;
+use crate::api::FieldName;
 use crate::api::{AsCStr, Cardinality, Varno};
 use crate::api::{HashMap, HashSet};
 use crate::index::fast_fields_helper::WhichFastField;
@@ -47,6 +47,9 @@ pub struct PrivateData {
     referenced_columns_count: usize,
     need_scores: bool,
     exec_method_type: ExecMethodType,
+    // Additional search predicates from join filters that are relevant for snippet/score generation
+    // Stores the entire simplified Boolean expression to preserve OR structures like (TRUE OR name:"Rowling")
+    join_predicates: Option<SearchQueryInput>,
 }
 
 mod var_attname_lookup_serializer {
@@ -69,10 +72,10 @@ mod var_attname_lookup_serializer {
 
         let p1 = p1_str
             .parse::<Varno>()
-            .map_err(|e| format!("Failed to parse first key part '{}': {}", p1_str, e))?;
+            .map_err(|e| format!("Failed to parse first key part '{p1_str}': {e}"))?;
         let p2 = p2_str
             .parse::<i16>()
-            .map_err(|e| format!("Failed to parse second key part '{}': {}", p2_str, e))?;
+            .map_err(|e| format!("Failed to parse second key part '{p2_str}': {e}"))?;
 
         Ok((p1, p2))
     }
@@ -113,7 +116,7 @@ mod var_attname_lookup_serializer {
 
         for (k_str, v) in string_map {
             let key_tuple = key_from_string(k_str)
-                .map_err(|e| D::Error::custom(format!("Invalid key format '{}': {}", k_str, e)))?;
+                .map_err(|e| D::Error::custom(format!("Invalid key format '{k_str}': {e}")))?;
             map.insert(key_tuple, v);
         }
         Ok(Some(map))
@@ -216,6 +219,10 @@ impl PrivateData {
     pub fn set_need_scores(&mut self, maybe: bool) {
         self.need_scores = maybe;
     }
+
+    pub fn set_join_predicates(&mut self, predicates: Option<SearchQueryInput>) {
+        self.join_predicates = predicates;
+    }
 }
 
 //
@@ -286,5 +293,9 @@ impl PrivateData {
 
     pub fn need_scores(&self) -> bool {
         self.need_scores
+    }
+
+    pub fn join_predicates(&self) -> &Option<SearchQueryInput> {
+        &self.join_predicates
     }
 }
